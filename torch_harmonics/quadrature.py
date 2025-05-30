@@ -224,3 +224,54 @@ def fejer2_weights(n: int, a: Optional[float]=-1.0, b: Optional[float]=1.0) -> T
     wcc = wcc * (b - a) * 0.5
 
     return tcc, wcc
+
+def sin_weights(n: int,
+                   a: Optional[float] = -1.0,
+                   b: Optional[float] = 1.0
+                  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Custom spherical quadrature on [x=a..b] in the cosine-theta domain.
+
+    Args:
+        n: Number of sample points
+        a: Lower bound in cos(theta) (x-space)
+        b: Upper bound in cos(theta) (x-space)
+
+    Returns:
+        xlg:  Cosine-of-latitude nodes (shape [n])
+        wlg:  Quadrature weights ∆x for each band (shape [n])
+    """
+    # Ensure bounds are ordered
+    x0, x1 = (a, b) if a <= b else (b, a)
+
+    # Map cos-domain bounds back to latitude [0..π]
+    lat_lo = math.acos(x1)
+    lat_hi = math.acos(x0)
+
+    # Uniform mid-latitude sampling
+    lats = torch.linspace(lat_lo, lat_hi, n,
+                          dtype=torch.float64,
+                          requires_grad=False)
+    # Band width in latitude
+    dlat = lats[1] - lats[0]
+
+    # Latitude edges for each band
+    edges = torch.empty(n + 1, dtype=torch.float64)
+    edges[1:-1] = 0.5 * (lats[:-1] + lats[1:])
+    edges[0]    = lats[0]    - 0.5 * dlat
+    edges[-1]   = lats[-1]   + 0.5 * dlat
+
+    # ∆sin(lat) integration = ∆x in cos-theta domain
+    sin_vals = torch.sin(edges - math.pi / 2)
+    wlg = sin_vals[1:] - sin_vals[:-1]
+
+    # Adjust cap weights if domain touches poles
+    if x1 == 1.0:
+        wlg[0]    = wlg[1] / 8.0
+    if x0 == -1.0:
+        wlg[-1]   = wlg[-2] / 8.0
+
+    # Convert latitudes back to cos-domain nodes
+    xlg = torch.cos(lats)
+
+    return xlg, wlg
