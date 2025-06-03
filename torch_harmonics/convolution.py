@@ -140,45 +140,82 @@ def _precompute_convolution_tensor_s2(
     in_shape: Tuple[int],
     out_shape: Tuple[int],
     filter_basis: FilterBasis,
-    grid_in: Optional[str]="equiangular",
-    grid_out: Optional[str]="equiangular",
-    theta_cutoff: Optional[float]=0.01 * math.pi,
-    theta_eps: Optional[float]=1e-3,
-    transpose_normalization: Optional[bool]=False,
-    basis_norm_mode: Optional[str]="mean",
-    merge_quadrature: Optional[bool]=False,
+    grid_in: Optional[str] = "equiangular",
+    grid_out: Optional[str] = "equiangular",
+    in_lon_range: Optional[tuple] = (0, 2 * math.pi),
+    out_lon_range: Optional[tuple] = (0, 2 * math.pi),
+    lat_range: Optional[tuple] = (0, math.pi),
+    theta_cutoff: Optional[float] = 0.01 * math.pi,
+    theta_eps: Optional[float] = 1e-3,
+    transpose_normalization: Optional[bool] = False,
+    basis_norm_mode: Optional[str] = "mean",
+    merge_quadrature: Optional[bool] = False,
 ):
     """
     Precomputes the rotated filters at positions $R^{-1}_j \omega_i = R^{-1}_j R_i \nu = Y(-\theta_j)Z(\phi_i - \phi_j)Y(\theta_j)\nu$.
     Assumes a tensorized grid on the sphere with an equidistant sampling in longitude as described in Ocampo et al.
     The output tensor has shape kernel_shape x nlat_out x (nlat_in * nlon_in).
 
-    The rotation of the Euler angles uses the YZY convention, which applied to the northpole $(0,0,1)^T$ yields
-    $$
-    Y(\alpha) Z(\beta) Y(\gamma) n =
-        {\begin{bmatrix}
-            \cos(\gamma)\sin(\alpha) + \cos(\alpha)\cos(\beta)\sin(\gamma) \\
-            \sin(\beta)\sin(\gamma) \\
-            \cos(\alpha)\cos(\gamma)-\cos(\beta)\sin(\alpha)\sin(\gamma)
-        \end{bmatrix}}
-    $$
+    Parameters
+    ----------
+    in_shape : tuple
+        Shape of the input grid (nlat_in, nlon_in)
+    out_shape : tuple
+        Shape of the output grid (nlat_out, nlon_out)
+    filter_basis : FilterBasis
+        Filter basis to use for the convolution
+    grid_in : str, optional
+        Input grid type, defaults to "equiangular"
+    grid_out : str, optional
+        Output grid type, defaults to "equiangular"
+    in_lon_range : tuple, optional
+        Input longitude range in radians, defaults to (0, 2π)
+    out_lon_range : tuple, optional
+        Output longitude range in radians, defaults to (0, 2π)
+    lat_range : tuple, optional
+        Latitude range in radians, defaults to (0, π)
+    theta_cutoff : float, optional
+        Neighborhood size in radians, defaults to 0.01π
+    theta_eps : float, optional
+        Small epsilon to avoid aliasing, defaults to 1e-3
+    transpose_normalization : bool, optional
+        Whether to use transpose normalization, defaults to False
+    basis_norm_mode : str, optional
+        Normalization mode, defaults to "mean"
+    merge_quadrature : bool, optional
+        Whether to merge quadrature weights, defaults to False
     """
 
     assert len(in_shape) == 2
     assert len(out_shape) == 2
 
     kernel_size = filter_basis.kernel_size
-
     nlat_in, nlon_in = in_shape
     nlat_out, nlon_out = out_shape
 
-    # precompute input and output grids
-    lats_in, win = _precompute_latitudes(nlat_in, grid=grid_in)
-    lats_out, wout = _precompute_latitudes(nlat_out, grid=grid_out)
+    # Compute padding points needed for attention window
+    padding_points = compute_lon_padding_columns(
+        lon_range=in_lon_range,
+        lat_range=lat_range,
+        nlon=nlon_in,
+        nlat=nlat_in,
+        radius_rad=theta_cutoff
+    )
 
-    # compute the phi differences
-    # It's imporatant to not include the 2 pi point in the longitudes, as it is equivalent to lon=0
-    lons_in = _precompute_longitudes(nlon_in)
+    # Compute ghost grid parameters
+    domain_size = in_lon_range[1] - in_lon_range[0]
+    cell_width = domain_size / nlon_in
+    ghost_lon_min = max(0, in_lon_range[0] - padding_points * cell_width)
+    ghost_lon_max = in_lon_range[1] + padding_points * cell_width
+    ghost_nlon_in = int(round((ghost_lon_max - ghost_lon_min) / cell_width))
+    start_idx = int(round((in_lon_range[0] - ghost_lon_min) / cell_width))
+    end_idx = start_idx + nlon_in
+
+    # precompute input and output grids
+    lats_in, win = _precompute_latitudes(nlat_in, grid=grid_in, a=lat_range[0], b=lat_range[1])
+    lats_out, wout = _precompute_latitudes(nlat_out, grid=grid_out, a=lat_range[0], b=lat_range[1])
+    lons_in = _precompute_longitudes(nlon_in, a=in_lon_range[0], b=in_lon_range[1])
+    lons_out = _precompute_longitudes(nlon_out, a=out_lon_range[0], b=out_lon_range[1])
 
     # compute quadrature weights and merge them into the convolution tensor.
     # These quadrature integrate to 1 over the sphere.
@@ -192,61 +229,56 @@ def _precompute_convolution_tensor_s2(
 
     out_idx = []
     out_vals = []
+
+    # single‐loop over latitudes, centered filter at lon_mid
+    center_lon = lons_out[nlon_out // 2]
     for t in range(nlat_out):
-        # the last angle has a negative sign as it is a passive rotation, which rotates the filter around the y-axis
         alpha = -lats_out[t]
-        beta = lons_in
+        beta = lons_in - center_lon
         gamma = lats_in.reshape(-1, 1)
 
-        # compute cartesian coordinates of the rotated position
-        # This uses the YZY convention of Euler angles, where the last angle (alpha) is a passive rotation,
-        # and therefore applied with a negative sign
+        # rotate north‐pole via Y(–lat)Z(Δlon)Y(lat)
         x = torch.cos(alpha) * torch.cos(beta) * torch.sin(gamma) + torch.cos(gamma) * torch.sin(alpha)
         y = torch.sin(beta) * torch.sin(gamma)
         z = -torch.cos(beta) * torch.sin(alpha) * torch.sin(gamma) + torch.cos(alpha) * torch.cos(gamma)
 
-        # normalization is important to avoid NaNs when arccos and atan are applied
-        # this can otherwise lead to spurious artifacts in the solution
+        # normalize
         norm = torch.sqrt(x * x + y * y + z * z)
-        x = x / norm
-        y = y / norm
-        z = z / norm
+        x, y, z = x / norm, y / norm, z / norm
 
-        # compute spherical coordinates, where phi needs to fall into the [0, 2pi) range
-        theta = torch.arccos(z)
-        phi = torch.arctan2(y, x)
-        phi = torch.where(phi < 0.0, phi + 2 * torch.pi, phi)
+        # spherical coords
+        theta = torch.acos(z)
+        phi = torch.atan2(y, x)
+        # **always** wrap φ into [0,2π)
+        phi = torch.remainder(phi, 2 * torch.pi)
 
-        # find the indices where the rotated position falls into the support of the kernel
+        # compute support
         iidx, vals = filter_basis.compute_support_vals(theta, phi, r_cutoff=theta_cutoff_eff)
 
-        # add the output latitude and reshape such that psi has dimensions kernel_shape x nlat_out x (nlat_in*nlon_in)
-        idx = torch.stack([iidx[:, 0], t * torch.ones_like(iidx[:, 0]), iidx[:, 1] * nlon_in + iidx[:, 2]], dim=0)
+        # build COO idx: (kernel, out_lat, in_flat)
+        idx = torch.stack([
+            iidx[:, 0],
+            t * torch.ones_like(iidx[:, 0]),
+            iidx[:, 1] * ghost_nlon_in + iidx[:, 2]
+        ], dim=0)
 
-        # append indices and values to the COO datastructure
         out_idx.append(idx)
         out_vals.append(vals)
 
-    # concatenate the indices and values
-    out_idx = torch.cat(out_idx, dim=-1)
+    # concat & normalize
+    out_idx = torch.cat(out_idx, dim=-1).contiguous()
     out_vals = torch.cat(out_vals, dim=-1)
-
     out_vals = _normalize_convolution_tensor_s2(
-        out_idx,
-        out_vals,
-        in_shape,
-        out_shape,
-        kernel_size,
+        out_idx, out_vals,
+        (nlat_in, ghost_nlon_in), out_shape, kernel_size,
         quad_weights,
         transpose_normalization=transpose_normalization,
         basis_norm_mode=basis_norm_mode,
         merge_quadrature=merge_quadrature,
     )
+    out_vals = out_vals.to(torch.float32).contiguous()
 
-    out_idx = out_idx.contiguous()
-    out_vals = out_vals.to(dtype=torch.float32).contiguous()
-
-    return out_idx, out_vals
+    return out_idx, out_vals, start_idx, ghost_nlon_in
 
 
 class DiscreteContinuousConv(nn.Module, metaclass=abc.ABCMeta):
@@ -317,28 +349,35 @@ class DiscreteContinuousConvS2(DiscreteContinuousConv):
         grid_out: Optional[str] = "equiangular",
         bias: Optional[bool] = True,
         theta_cutoff: Optional[float] = None,
+        lon_range: Optional[Tuple[float, float]] = (0, 2*math.pi),
+        lat_range: Optional[Tuple[float, float]] = (0, math.pi),
     ):
         super().__init__(in_channels, out_channels, kernel_shape, basis_type, groups, bias)
 
         self.nlat_in, self.nlon_in = in_shape
         self.nlat_out, self.nlon_out = out_shape
+        self.lon_range = lon_range
+        self.lat_range = lat_range
 
         # make sure the p-shift works by checking that longitudes are divisible
         assert self.nlon_in % self.nlon_out == 0
 
         # heuristic to compute theta cutoff based on the bandlimit of the input field and overlaps of the basis functions
         if theta_cutoff is None:
-            theta_cutoff = torch.pi / float(self.nlat_out - 1)
+            theta_cutoff = math.pi / float(self.nlat_out - 1)
 
         if theta_cutoff <= 0.0:
             raise ValueError("Error, theta_cutoff has to be positive.")
 
-        idx, vals = _precompute_convolution_tensor_s2(
+        idx, vals, self.start_idx, self.ghost_nlon_in = _precompute_convolution_tensor_s2(
             in_shape,
             out_shape,
             self.filter_basis,
             grid_in=grid_in,
             grid_out=grid_out,
+            in_lon_range=lon_range,
+            out_lon_range=lon_range,
+            lat_range=lat_range,
             theta_cutoff=theta_cutoff,
             transpose_normalization=False,
             basis_norm_mode=basis_norm_mode,
@@ -366,7 +405,7 @@ class DiscreteContinuousConvS2(DiscreteContinuousConv):
         r"""
         Pretty print module
         """
-        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_chans={self.groupsize * self.groups}, out_chans={self.weight.shape[0]}, filter_basis={self.filter_basis}, kernel_shape={self.kernel_shape}, groups={self.groups}"
+        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_chans={self.groupsize * self.groups}, out_chans={self.weight.shape[0]}, filter_basis={self.filter_basis}, kernel_shape={self.kernel_shape}, groups={self.groups}, lon_range={self.lon_range}, start_idx={self.start_idx}"
 
     @property
     def psi_idx(self):
@@ -423,29 +462,36 @@ class DiscreteContinuousConvTransposeS2(DiscreteContinuousConv):
         grid_out: Optional[str] = "equiangular",
         bias: Optional[bool] = True,
         theta_cutoff: Optional[float] = None,
+        lon_range: Optional[Tuple[float, float]] = (0, 2*math.pi),
+        lat_range: Optional[Tuple[float, float]] = (0, math.pi),
     ):
         super().__init__(in_channels, out_channels, kernel_shape, basis_type, groups, bias)
 
         self.nlat_in, self.nlon_in = in_shape
         self.nlat_out, self.nlon_out = out_shape
+        self.lon_range = lon_range
+        self.lat_range = lat_range
 
         # make sure the p-shift works by checking that longitudes are divisible
         assert self.nlon_out % self.nlon_in == 0
 
         # bandlimit
         if theta_cutoff is None:
-            theta_cutoff = torch.pi / float(self.nlat_in - 1)
+            theta_cutoff = math.pi / float(self.nlat_in - 1)
 
         if theta_cutoff <= 0.0:
             raise ValueError("Error, theta_cutoff has to be positive.")
 
         # switch in_shape and out_shape since we want the transpose convolution
-        idx, vals = _precompute_convolution_tensor_s2(
+        idx, vals, self.start_idx, self.ghost_nlon_in = _precompute_convolution_tensor_s2(
             out_shape,
             in_shape,
             self.filter_basis,
             grid_in=grid_out,
             grid_out=grid_in,
+            in_lon_range=lon_range,
+            out_lon_range=lon_range,
+            lat_range=lat_range,
             theta_cutoff=theta_cutoff,
             transpose_normalization=True,
             basis_norm_mode=basis_norm_mode,
@@ -473,7 +519,7 @@ class DiscreteContinuousConvTransposeS2(DiscreteContinuousConv):
         r"""
         Pretty print module
         """
-        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_chans={self.groupsize * self.groups}, out_chans={self.weight.shape[0]}, filter_basis={self.filter_basis}, kernel_shape={self.kernel_shape}, groups={self.groups}"
+        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_chans={self.groupsize * self.groups}, out_chans={self.weight.shape[0]}, filter_basis={self.filter_basis}, kernel_shape={self.kernel_shape}, groups={self.groups}, lon_range={self.lon_range}, start_idx={self.start_idx}"
 
     @property
     def psi_idx(self):

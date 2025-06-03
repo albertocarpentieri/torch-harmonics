@@ -211,14 +211,20 @@ class NeighborhoodAttentionS2(nn.Module):
         input grid type, "equiangular" by default
     grid_out: str, optional
         output grid type, "equiangular" by default
+    num_heads: int, optional
+        number of attention heads
+    scale: float, optional
+        scaling factor for attention
     bias: bool, optional
         if specified, adds bias to input / output projection layers
     theta_cutoff: float, optional
         neighborhood size
-    k_channels: int
-        number of dimensions for interior inner product in the attention matrix (corresponds to kdim in MHA in PyTorch)
+    k_channels: int, optional
+        number of dimensions for interior inner product in the attention matrix
     out_channels: int, optional
-        number of dimensions for interior inner product in the attention matrix (corresponds to vdim in MHA in PyTorch)
+        number of dimensions for interior inner product in the attention matrix
+    lon_range: tuple, optional
+        longitude range in radians, defaults to (0, 2π) for full sphere
     """
 
     def __init__(
@@ -234,21 +240,43 @@ class NeighborhoodAttentionS2(nn.Module):
         theta_cutoff: Optional[float] = None,
         k_channels: Optional[int] = None,
         out_channels: Optional[int] = None,
+        lon_range: Optional[Tuple[float, float]] = (0, 2*math.pi),
     ):
         super().__init__()
 
         self.nlat_in, self.nlon_in = in_shape
         self.nlat_out, self.nlon_out = out_shape
+        self.lon_range = lon_range
 
         self.in_channels = in_channels
         self.num_heads = num_heads
         self.k_channels = in_channels if k_channels is None else k_channels
         self.out_channels = in_channels if out_channels is None else out_channels
 
-        # heuristic to compute theta cutoff based on the bandlimit of the input field and overlaps of the basis functions
+        # Compute start_idx based on longitude range
+        domain_size = lon_range[1] - lon_range[0]
+        cell_width = domain_size / self.nlon_in
+        
+        # Compute padding points needed for attention window
         if theta_cutoff is None:
-            theta_cutoff = torch.pi / float(self.nlat_out - 1)
+            theta_cutoff = math.pi / float(self.nlat_out - 1)
+            
+        padding_points = compute_lon_padding_columns(
+            lon_range=lon_range,
+            lat_range=(0, math.pi),  # Full latitude range
+            nlon=self.nlon_in,
+            nlat=self.nlat_in,
+            radius_rad=theta_cutoff
+        )
+        
+        # Compute ghost grid parameters
+        ghost_lon_min = max(0, lon_range[0] - padding_points * cell_width)
+        ghost_lon_max = lon_range[1] + padding_points * cell_width
+        self.ghost_nlon_in = int(round((ghost_lon_max - ghost_lon_min) / cell_width))
+        self.start_idx = int(round((lon_range[0] - ghost_lon_min) / cell_width))
+        self.end_idx = self.start_idx + self.nlon_in
 
+        # heuristic to compute theta cutoff based on the bandlimit of the input field and overlaps of the basis functions
         if theta_cutoff <= 0.0:
             raise ValueError("Error, theta_cutoff has to be positive.")
 
@@ -258,8 +286,6 @@ class NeighborhoodAttentionS2(nn.Module):
         self.register_buffer("quad_weights", quad_weights, persistent=False)
 
         # create a dummy filter basis to pass to the construction of the convolution tensor
-        # this is to avoid code duplication as the logic of pre-computing the sparsity pattern
-        # is identical to convolutions with a constant filter function
         fb = get_filter_basis(kernel_shape=1, basis_type="zernike")
 
         # precompute the neighborhood sparsity pattern
@@ -275,7 +301,7 @@ class NeighborhoodAttentionS2(nn.Module):
             merge_quadrature=True,
         )
 
-        # this is kept for legacy resons in case we want to resuse sorting of these entries
+        # this is kept for legacy reasons in case we want to reuse sorting of these entries
         row_idx = idx[1, ...].contiguous()
         col_idx = idx[2, ...].contiguous()
 
@@ -297,11 +323,8 @@ class NeighborhoodAttentionS2(nn.Module):
         self.register_buffer("psi_row_idx", row_idx, persistent=False)
         self.register_buffer("psi_col_idx", col_idx, persistent=False)
         self.register_buffer("psi_roff_idx", row_offset, persistent=False)
-        # self.register_buffer("psi_vals", vals, persistent=False)
 
         # learnable parameters
-        # TODO: double-check that this gives us the correct initialization magnitudes
-        # the standard MHA uses xavier uniform, NATTEN uses kaiming. Let's use that for now
         if self.k_channels % self.num_heads != 0:
             raise ValueError(f"Please make sure that number of heads {self.num_heads} divides k_channels {self.k_channels} evenly.")
         if self.out_channels % self.num_heads != 0:
@@ -333,10 +356,13 @@ class NeighborhoodAttentionS2(nn.Module):
         r"""
         Pretty print module
         """
-        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_channels={self.in_channels}, out_channels={self.out_channels}, k_channels={self.k_channels}"
+        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_channels={self.in_channels}, out_channels={self.out_channels}, k_channels={self.k_channels}, lon_range={self.lon_range}, start_idx={self.start_idx}"
 
     def forward(self, query: torch.Tensor, key: Optional[torch.Tensor] = None, value: Optional[torch.Tensor] = None) -> torch.Tensor:
-
+        # Input validation
+        if query.dim() != 4:
+            raise ValueError(f"Expected 4D input tensor, got {query.dim()}D")
+        
         # self attention simplification
         if key is None:
             key = query
@@ -344,15 +370,17 @@ class NeighborhoodAttentionS2(nn.Module):
         if value is None:
             value = query
 
-        # change this later to allow arbitrary number of batch dims
-        assert (query.dim() == key.dim()) and (key.dim() == value.dim()) and (value.dim() == 4)
+        # Validate input shapes
+        if key.shape != value.shape:
+            raise ValueError(f"Key and value shapes must match, got {key.shape} and {value.shape}")
+        if key.shape[2:] != (self.nlat_in, self.nlon_in):
+            raise ValueError(f"Expected input shape {(self.nlat_in, self.nlon_in)}, got {key.shape[2:]}")
 
         # do the scaling
         query_scaled = query * self.scale
 
         # TODO: insert dimension checks for input
         if query.is_cuda and _cuda_extension_available:
-
             out = _neighborhood_attention_s2_cuda(
                 key,
                 value,
@@ -371,6 +399,7 @@ class NeighborhoodAttentionS2(nn.Module):
                 self.nlon_in,
                 self.nlat_out,
                 self.nlon_out,
+                self.start_idx,
             )
         else:
             if query.is_cuda:
@@ -394,6 +423,7 @@ class NeighborhoodAttentionS2(nn.Module):
                 self.nlon_in,
                 self.nlat_out,
                 self.nlon_out,
+                self.start_idx,
             )
 
         out = nn.functional.conv2d(out, self.proj_weights, bias=self.proj_bias)

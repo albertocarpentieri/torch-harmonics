@@ -46,7 +46,7 @@ except ImportError as err:
 
 def _neighborhood_attention_s2_fwd_torch(kx: torch.Tensor, vx: torch.Tensor, qy: torch.Tensor,
                                          quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                                         nlon_in: int, nlat_out: int, nlon_out: int) -> torch.Tensor:
+                                         nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int) -> torch.Tensor:
 
 
     # prepare result tensor
@@ -62,20 +62,21 @@ def _neighborhood_attention_s2_fwd_torch(kx: torch.Tensor, vx: torch.Tensor, qy:
 
             alpha_sum = torch.zeros((y.shape[0],), dtype=y.dtype, device=y.device)
             qdotk_nz = torch.zeros((y.shape[0], zend-zstart,), dtype=y.dtype, device=y.device)
-
+            center_shift = wo - (nlon_out // 2)
+            
             for idz in range(zstart, zend):
                 nz_col_idx = col_idx[idz]
 
                 # compute input indices from psi datastructure
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
-                wi = nz_col_idx % nlon_in
-                wip = (wi + wo) % nlon_in
-
-                # compute correlation & softmax numerator
-                q_ho_wo = qy[:, :, ho, wo]
-                k_hi_wip = kx[:, :, hi, wip]
-                qdotk_nz[:,idz-zstart] = torch.sum(q_ho_wo * k_hi_wip, dim=1)
+                wi = nz_col_idx % nlon_in + center_shift
+                wip = (wi + wo) % nlon_in - start_idx
+                if wip < k_hi_wip.shape[-1] and wip >= 0:
+                    # compute correlation & softmax numerator
+                    q_ho_wo = qy[:, :, ho, wo]
+                    k_hi_wip = kx[:, :, hi, wip]
+                    qdotk_nz[:,idz-zstart] = torch.sum(q_ho_wo * k_hi_wip, dim=1)
 
             qdotk_max, _ = torch.max(qdotk_nz, dim=1)
 

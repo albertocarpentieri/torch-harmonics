@@ -35,7 +35,7 @@ import math
 import numpy as np
 import torch
 
-def _precompute_grid(n: int, grid: Optional[str]="equidistant", a: Optional[float]=0.0, b: Optional[float]=1.0,
+def _precompute_grid(n: int, grid: Optional[str]="equidistant", a: Optional[float]=0.0, b: Optional[float]=math.pi,
                      periodic: Optional[bool]=False) -> Tuple[torch.Tensor, torch.Tensor]:
 
     if (grid != "equidistant") and periodic:
@@ -43,44 +43,54 @@ def _precompute_grid(n: int, grid: Optional[str]="equidistant", a: Optional[floa
 
     # compute coordinates
     if grid == "equidistant":
+        # Transform latitude bounds to cosine domain
+        a, b = math.cos(b), math.cos(a) 
         xlg, wlg = trapezoidal_weights(n, a=a, b=b, periodic=periodic)
     elif grid == "legendre-gauss":
+        a, b = math.cos(b), math.cos(a)
         xlg, wlg = legendre_gauss_weights(n, a=a, b=b)
     elif grid == "lobatto":
+        a, b = math.cos(b), math.cos(a)
         xlg, wlg = lobatto_weights(n, a=a, b=b)
     elif grid == "equiangular":
+        a, b = math.cos(b), math.cos(a)
         xlg, wlg = clenshaw_curtiss_weights(n, a=a, b=b)
+    elif grid == "cosine":
+        xlg, wlg = cosine_weights(n, a, b)
     else:
         raise ValueError(f"Unknown grid type {grid}")
 
     return xlg, wlg
 
 @lru_cache(typed=True, copy=True)
-def _precompute_longitudes(nlon: int):
+def _precompute_longitudes(nlon: int, a: float = 0, b: float = 2 * math.pi):
     r"""
     Convenience routine to precompute longitudes
+    Args:
+        nlon: Number of longitude points
+        custom_grid: Optional custom longitude grid in radians [0, 2π]
     """
-    
-    lons = torch.linspace(0, 2 * math.pi, nlon+1, dtype=torch.float64, requires_grad=False)[:-1]
+    if a == 0 and b == math.pi * 2:
+        lons = torch.linspace(0 if a is None else a, 2 * math.pi if b is None else b, nlon+1, dtype=torch.float64, requires_grad=False)[:-1]
+    else:
+        lons = torch.linspace(a, b, nlon, dtype=torch.float64, requires_grad=False)
     return lons
 
-
 @lru_cache(typed=True, copy=True)
-def _precompute_latitudes(nlat: int, grid: Optional[str]="equiangular") -> Tuple[torch.Tensor, torch.Tensor]:
+def _precompute_latitudes(nlat: int, grid: Optional[str]="equiangular", a: Optional[float]=0, b: Optional[float]=math.pi) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Convenience routine to precompute latitudes
     """
         
     # compute coordinates in the cosine theta domain
-    xlg, wlg = _precompute_grid(nlat, grid=grid, a=-1.0, b=1.0, periodic=False)
-    
+    xlg, wlg = _precompute_grid(nlat, grid=grid, a=a, b=b, periodic=False)
+    if grid == "cosine":
+        return xlg, wlg
     # to perform the quadrature and account for the jacobian of the sphere, the quadrature rule
     # is formulated in the cosine theta domain, which is designed to integrate functions of cos theta
     lats = torch.flip(torch.arccos(xlg), dims=(0,)).clone()
     wlg = torch.flip(wlg, dims=(0,)).clone()
-    
     return lats, wlg
-
 
 def trapezoidal_weights(n: int, a: Optional[float]=-1.0, b: Optional[float]=1.0, periodic: Optional[bool]=False) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
@@ -225,53 +235,23 @@ def fejer2_weights(n: int, a: Optional[float]=-1.0, b: Optional[float]=1.0) -> T
 
     return tcc, wcc
 
-def sin_weights(n: int,
-                   a: Optional[float] = -1.0,
-                   b: Optional[float] = 1.0
-                  ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Custom spherical quadrature on [x=a..b] in the cosine-theta domain.
+# Quadrature Weights for Sphere Slice
+def cosine_weights(n: int, a: Optional[float]=0, b: Optional[float]=math.pi) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    Args:
-        n: Number of sample points
-        a: Lower bound in cos(theta) (x-space)
-        b: Upper bound in cos(theta) (x-space)
-
-    Returns:
-        xlg:  Cosine-of-latitude nodes (shape [n])
-        wlg:  Quadrature weights ∆x for each band (shape [n])
-    """
-    # Ensure bounds are ordered
-    x0, x1 = (a, b) if a <= b else (b, a)
-
-    # Map cos-domain bounds back to latitude [0..π]
-    lat_lo = math.acos(x1)
-    lat_hi = math.acos(x0)
-
-    # Uniform mid-latitude sampling
-    lats = torch.linspace(lat_lo, lat_hi, n,
-                          dtype=torch.float64,
-                          requires_grad=False)
-    # Band width in latitude
+    lats = torch.linspace(a, b, n, dtype=torch.float64, requires_grad=False)
+    # retrieve latitude resolution
     dlat = lats[1] - lats[0]
-
-    # Latitude edges for each band
-    edges = torch.empty(n + 1, dtype=torch.float64)
-    edges[1:-1] = 0.5 * (lats[:-1] + lats[1:])
-    edges[0]    = lats[0]    - 0.5 * dlat
-    edges[-1]   = lats[-1]   + 0.5 * dlat
-
-    # ∆sin(lat) integration = ∆x in cos-theta domain
-    sin_vals = torch.sin(edges - math.pi / 2)
-    wlg = sin_vals[1:] - sin_vals[:-1]
-
-    # Adjust cap weights if domain touches poles
-    if x1 == 1.0:
-        wlg[0]    = wlg[1] / 8.0
-    if x0 == -1.0:
-        wlg[-1]   = wlg[-2] / 8.0
-
-    # Convert latitudes back to cos-domain nodes
-    xlg = torch.cos(lats)
-
-    return xlg, wlg
+    
+    lat_edges = lats.new_empty(lats.size(0) + 1)
+    lat_edges[1:-1] = 0.5 * (lats[:-1] + lats[1:])
+    lat_edges[0] = lats[0] - 0.5 * dlat
+    lat_edges[-1] = lats[-1] + 0.5 * dlat
+    
+    sin_lat = torch.sin(lat_edges - math.pi / 2)              # shape (N+1,)
+    
+    d_sin_lat = sin_lat[1:] - sin_lat[:-1]
+    if a == 0:
+        d_sin_lat[0] = d_sin_lat[1] / 8
+    if b == math.pi:
+        d_sin_lat[-1] = d_sin_lat[-2] / 8
+    return lats, d_sin_lat

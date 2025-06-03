@@ -40,7 +40,8 @@ torch::Tensor s2_attention_fwd_cuda(at::Tensor kx, at::Tensor vx,
                                     at::Tensor qy, at::Tensor quad_weights,
                                     at::Tensor psi_col_idx,
                                     at::Tensor psi_row_off,
-                                    int nlon_in, int nlat_out, int nlon_out);
+                                    int nlon_in, int nlat_out, int nlon_out,
+                                    int start_idx);
 
 std::tuple<at::Tensor,at::Tensor,at::Tensor> s2_attention_bwd_dkvq_cuda(at::Tensor kx, at::Tensor vx,
                                          at::Tensor qy,
@@ -48,7 +49,8 @@ std::tuple<at::Tensor,at::Tensor,at::Tensor> s2_attention_bwd_dkvq_cuda(at::Tens
                                          at::Tensor quad_weights,
                                          at::Tensor psi_col_idx,
                                          at::Tensor psi_row_off,
-                                         int nlon_in, int nlat_out, int nlon_out);
+                                         int nlon_in, int nlat_out, int nlon_out,
+                                         int start_idx);
 
 torch::Tensor s2_attention_bwd_dq_cuda(at::Tensor kx,
                                        at::Tensor vx,
@@ -57,7 +59,8 @@ torch::Tensor s2_attention_bwd_dq_cuda(at::Tensor kx,
                                        at::Tensor quad_weights,
                                        at::Tensor psi_col_idx,
                                        at::Tensor psi_row_off,
-                                       int nlon_in, int nlat_out, int nlon_out);
+                                       int nlon_in, int nlat_out, int nlon_out,
+                                       int start_idx);
 
 torch::Tensor s2_attention_bwd_dk_cuda(at::Tensor kx,
                                        at::Tensor vx,
@@ -66,7 +69,8 @@ torch::Tensor s2_attention_bwd_dk_cuda(at::Tensor kx,
                                        at::Tensor quad_weights,
                                        at::Tensor psi_col_idx,
                                        at::Tensor psi_row_off,
-                                       int nlon_in, int nlat_out, int nlon_out);
+                                       int nlon_in, int nlat_out, int nlon_out,
+                                       int start_idx);
 
 torch::Tensor s2_attention_bwd_dv_cuda(at::Tensor kx,
                                        at::Tensor vx,
