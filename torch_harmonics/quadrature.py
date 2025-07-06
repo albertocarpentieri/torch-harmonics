@@ -56,23 +56,25 @@ def _precompute_grid(n: int, grid: Optional[str]="equidistant", a: Optional[floa
     return xlg, wlg
 
 @lru_cache(typed=True, copy=True)
-def _precompute_longitudes(nlon: int):
+def _precompute_longitudes(nlon: int, a: float = 0, b: float = 2 * math.pi):
     r"""
     Convenience routine to precompute longitudes
     """
-    
-    lons = torch.linspace(0, 2 * math.pi, nlon+1, dtype=torch.float64, requires_grad=False)[:-1]
+    if math.isclose(a, 0.0,  abs_tol=1e-8) and math.isclose(b, 2 * math.pi,  abs_tol=1e-8):
+        lons = torch.linspace(0, 2 * math.pi, nlon+1, dtype=torch.float64, requires_grad=False)[:-1]
+    else:
+        lons = torch.linspace(a, b, nlon, dtype=torch.float64, requires_grad=False)
     return lons
 
 
 @lru_cache(typed=True, copy=True)
-def _precompute_latitudes(nlat: int, grid: Optional[str]="equiangular") -> Tuple[torch.Tensor, torch.Tensor]:
+def _precompute_latitudes(nlat: int, grid: Optional[str]="equiangular", a: float = -1.0, b: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Convenience routine to precompute latitudes
     """
         
     # compute coordinates in the cosine theta domain
-    xlg, wlg = _precompute_grid(nlat, grid=grid, a=-1.0, b=1.0, periodic=False)
+    xlg, wlg = _precompute_grid(nlat, grid=grid, a=a, b=b, periodic=False)
     
     # to perform the quadrature and account for the jacobian of the sphere, the quadrature rule
     # is formulated in the cosine theta domain, which is designed to integrate functions of cos theta
@@ -81,6 +83,50 @@ def _precompute_latitudes(nlat: int, grid: Optional[str]="equiangular") -> Tuple
     
     return lats, wlg
 
+def regional_weights(
+    n: int,
+    a: Optional[float] = -1.0,   # lower bound in cos theta  (−1  = south pole)
+    b: Optional[float] =  1.0    # upper bound in cos theta  (+1  = north pole)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generate a latitude grid that is *uniform in theta* but expressed in the
+    cos theta domain, **matching the conventions expected by _precompute_latitudes**.
+
+    Returns
+    -------
+    xlg : torch.Tensor
+        Cos theta of the cell centres, **strictly ascending** from a to b (size n).
+    wlg : torch.Tensor
+        Quadrature weights delta(sin theta) for those cells, in the *same order* as xlg.
+    """
+    theta_a = math.acos(a)       
+    theta_b = math.acos(b)       
+
+    lats = torch.linspace(theta_a, theta_b, n, dtype=torch.float64, requires_grad=False)
+
+    # cos nodes; flip so they ascend (−1, +1) 
+    xlg = torch.flip(torch.cos(lats), dims=(0,)).clone()
+
+    dlat = lats[1] - lats[0]
+
+    lat_edges = lats.new_empty(n + 1)
+    lat_edges[1:-1] = 0.5 * (lats[:-1] + lats[1:])
+    lat_edges[0]  = lats[0]  - 0.5 * dlat
+    lat_edges[-1] = lats[-1] + 0.5 * dlat
+
+    sin_edges = torch.sin(lat_edges - math.pi / 2)      # = −cos theta_edges
+    d_sin_lat = sin_edges[1:] - sin_edges[:-1]
+
+    # pole-cap taper (mirrors original routine)
+    if math.isclose(theta_a, 0.0,  abs_tol=1e-8):       # north pole
+        d_sin_lat[0]  = d_sin_lat[1]  / 8
+    if math.isclose(theta_b, math.pi, abs_tol=1e-8):    # south pole
+        d_sin_lat[-1] = d_sin_lat[-2] / 8
+
+    # flip so weights follow the same (ascending) order as xlg
+    wlg = torch.flip(d_sin_lat, dims=(0,)).clone()
+
+    return xlg, wlg
 
 def trapezoidal_weights(n: int, a: Optional[float]=-1.0, b: Optional[float]=1.0, periodic: Optional[bool]=False) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
