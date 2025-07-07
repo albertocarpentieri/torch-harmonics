@@ -140,13 +140,16 @@ def _precompute_convolution_tensor_s2(
     in_shape: Tuple[int],
     out_shape: Tuple[int],
     filter_basis: FilterBasis,
-    grid_in: Optional[str]="equiangular",
-    grid_out: Optional[str]="equiangular",
-    theta_cutoff: Optional[float]=0.01 * math.pi,
-    theta_eps: Optional[float]=1e-3,
-    transpose_normalization: Optional[bool]=False,
-    basis_norm_mode: Optional[str]="mean",
-    merge_quadrature: Optional[bool]=False,
+    grid_in: Optional[str] = "cosine",
+    grid_out: Optional[str] = "cosine",
+    in_lon_range: Optional[tuple] = (0, 2 * math.pi),
+    out_lon_range: Optional[tuple] = (0, 2 * math.pi),
+    lat_range: Optional[tuple] = (0, math.pi),
+    theta_cutoff: Optional[float] = 0.01 * math.pi,
+    theta_eps: Optional[float] = 1e-3,
+    transpose_normalization: Optional[bool] = False,
+    basis_norm_mode: Optional[str] = "mean",
+    merge_quadrature: Optional[bool] = False,
 ):
     """
     Precomputes the rotated filters at positions $R^{-1}_j \omega_i = R^{-1}_j R_i \nu = Y(-\theta_j)Z(\phi_i - \phi_j)Y(\theta_j)\nu$.
@@ -163,91 +166,76 @@ def _precompute_convolution_tensor_s2(
         \end{bmatrix}}
     $$
     """
-
-    assert len(in_shape) == 2
-    assert len(out_shape) == 2
-
     kernel_size = filter_basis.kernel_size
-
     nlat_in, nlon_in = in_shape
     nlat_out, nlon_out = out_shape
 
-    # precompute input and output grids
-    lats_in, win = _precompute_latitudes(nlat_in, grid=grid_in)
-    lats_out, wout = _precompute_latitudes(nlat_out, grid=grid_out)
+    # precompute latitudes & weights
+    lats_in, win = _precompute_latitudes(nlat_in, grid=grid_in, a=math.cos(lat_range[1]), b=math.cos(lat_range[0]))
+    lats_out, wout = _precompute_latitudes(nlat_out, grid=grid_out, a=math.cos(lat_range[1]), b=math.cos(lat_range[0]))
+    lons_in = _precompute_longitudes(nlon_in, a=in_lon_range[0], b=in_lon_range[1])
+    lons_out = _precompute_longitudes(nlon_out, a=out_lon_range[0], b=out_lon_range[1])
 
-    # compute the phi differences
-    # It's imporatant to not include the 2 pi point in the longitudes, as it is equivalent to lon=0
-    lons_in = _precompute_longitudes(nlon_in)
-
-    # compute quadrature weights and merge them into the convolution tensor.
-    # These quadrature integrate to 1 over the sphere.
+    # quadrature weights
     if transpose_normalization:
         quad_weights = wout.reshape(-1, 1) / nlon_in / 2.0
     else:
         quad_weights = win.reshape(-1, 1) / nlon_in / 2.0
 
-    # effective theta cutoff if multiplied with a fudge factor to avoid aliasing with grid width (especially near poles)
     theta_cutoff_eff = (1.0 + theta_eps) * theta_cutoff
 
     out_idx = []
     out_vals = []
+
+    # single‐loop over latitudes, centered filter at lon_mid
+    center_lon = lons_out[nlon_out // 2]
     for t in range(nlat_out):
-        # the last angle has a negative sign as it is a passive rotation, which rotates the filter around the y-axis
         alpha = -lats_out[t]
-        beta = lons_in
+        beta = lons_in - center_lon
         gamma = lats_in.reshape(-1, 1)
 
-        # compute cartesian coordinates of the rotated position
-        # This uses the YZY convention of Euler angles, where the last angle (alpha) is a passive rotation,
-        # and therefore applied with a negative sign
+        # rotate north‐pole via Y(–lat)Z(Δlon)Y(lat)
         x = torch.cos(alpha) * torch.cos(beta) * torch.sin(gamma) + torch.cos(gamma) * torch.sin(alpha)
         y = torch.sin(beta) * torch.sin(gamma)
         z = -torch.cos(beta) * torch.sin(alpha) * torch.sin(gamma) + torch.cos(alpha) * torch.cos(gamma)
 
-        # normalization is important to avoid NaNs when arccos and atan are applied
-        # this can otherwise lead to spurious artifacts in the solution
+        # normalize
         norm = torch.sqrt(x * x + y * y + z * z)
-        x = x / norm
-        y = y / norm
-        z = z / norm
+        x, y, z = x / norm, y / norm, z / norm
 
-        # compute spherical coordinates, where phi needs to fall into the [0, 2pi) range
-        theta = torch.arccos(z)
-        phi = torch.arctan2(y, x)
-        phi = torch.where(phi < 0.0, phi + 2 * torch.pi, phi)
+        # spherical coords
+        theta = torch.acos(z)
+        phi = torch.atan2(y, x)
+        # **always** wrap φ into [0,2π)
+        phi = torch.remainder(phi, 2 * torch.pi)
 
-        # find the indices where the rotated position falls into the support of the kernel
+        # compute support
         iidx, vals = filter_basis.compute_support_vals(theta, phi, r_cutoff=theta_cutoff_eff)
 
-        # add the output latitude and reshape such that psi has dimensions kernel_shape x nlat_out x (nlat_in*nlon_in)
-        idx = torch.stack([iidx[:, 0], t * torch.ones_like(iidx[:, 0]), iidx[:, 1] * nlon_in + iidx[:, 2]], dim=0)
+        # build COO idx: (kernel, out_lat, in_flat)
+        idx = torch.stack([
+            iidx[:, 0],
+            t * torch.ones_like(iidx[:, 0]),
+            iidx[:, 1] * nlon_in + iidx[:, 2]
+        ], dim=0)
 
-        # append indices and values to the COO datastructure
         out_idx.append(idx)
         out_vals.append(vals)
 
-    # concatenate the indices and values
-    out_idx = torch.cat(out_idx, dim=-1)
+    # concat & normalize
+    out_idx = torch.cat(out_idx, dim=-1).contiguous()
     out_vals = torch.cat(out_vals, dim=-1)
-
     out_vals = _normalize_convolution_tensor_s2(
-        out_idx,
-        out_vals,
-        in_shape,
-        out_shape,
-        kernel_size,
+        out_idx, out_vals,
+        in_shape, out_shape, kernel_size,
         quad_weights,
         transpose_normalization=transpose_normalization,
         basis_norm_mode=basis_norm_mode,
         merge_quadrature=merge_quadrature,
     )
-
-    out_idx = out_idx.contiguous()
-    out_vals = out_vals.to(dtype=torch.float32).contiguous()
+    out_vals = out_vals.to(torch.float32).contiguous()
 
     return out_idx, out_vals
-
 
 class DiscreteContinuousConv(nn.Module, metaclass=abc.ABCMeta):
     """
