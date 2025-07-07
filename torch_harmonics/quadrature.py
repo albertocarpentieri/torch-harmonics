@@ -101,13 +101,13 @@ def cosine_weights(
     wlg : torch.Tensor
         Quadrature weights delta(sin theta) for those cells, in the *same order* as xlg.
     """
-    theta_a = math.acos(a)       
-    theta_b = math.acos(b)       
+    theta_a = math.acos(b)       
+    theta_b = math.acos(a)       
 
     lats = torch.linspace(theta_a, theta_b, n, dtype=torch.float64, requires_grad=False)
 
     # cos nodes; flip so they ascend (−1, +1) 
-    xlg = torch.cos(lats).clone()
+    xlg = torch.flip(torch.cos(lats), dims=(0,)).clone()
 
     dlat = lats[1] - lats[0]
 
@@ -117,7 +117,7 @@ def cosine_weights(
     lat_edges[-1] = lats[-1] + 0.5 * dlat
 
     sin_edges = torch.sin(lat_edges - math.pi / 2)      # = −cos theta_edges
-    d_sin_lat = - (sin_edges[1:] - sin_edges[:-1])
+    d_sin_lat = sin_edges[1:] - sin_edges[:-1]
 
     # pole-cap taper (mirrors original routine)
     if math.isclose(theta_a, 0.0,  abs_tol=1e-8):       # north pole
@@ -127,7 +127,7 @@ def cosine_weights(
 
     # flip so weights follow the same (ascending) order as xlg
     wlg = torch.flip(d_sin_lat, dims=(0,)).clone()
-
+    # xlg = torch.flip(xlg, dims=(0,)).clone()
     return xlg, wlg
 
 def trapezoidal_weights(n: int, a: Optional[float]=-1.0, b: Optional[float]=1.0, periodic: Optional[bool]=False) -> Tuple[torch.Tensor, torch.Tensor]:

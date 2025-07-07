@@ -381,7 +381,8 @@ class _NeighborhoodAttentionS2(torch.autograd.Function):
 
         output = _neighborhood_attention_s2_fwd_torch(kw, vw, qw, quad_weights,
                                                       col_idx, row_off,
-                                                      nlon_in, nlat_out, nlon_out)
+                                                      nlon_in, nlat_out, nlon_out,
+                                                      start_idx, end_idx)
 
         _, C, H, W = output.shape
         output = output.reshape(B, -1, H, W)
@@ -391,11 +392,13 @@ class _NeighborhoodAttentionS2(torch.autograd.Function):
     @staticmethod
     @custom_bwd(device_type="cpu")
     def backward(ctx, grad_output):
-        col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq, start_idx, end_idx = ctx.saved_tensors
+        col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq = ctx.saved_tensors
         nh = ctx.nh
         nlon_in = ctx.nlon_in
         nlat_out = ctx.nlat_out
         nlon_out = ctx.nlon_out
+        start_idx = ctx.start_idx
+        end_idx = ctx.end_idx
 
         kw = F.conv2d(k, weight=wk, bias=bk)
         vw = F.conv2d(v, weight=wv, bias=bv)
@@ -464,7 +467,7 @@ class _NeighborhoodAttentionS2(torch.autograd.Function):
             dbq = None
 
         return dk, dv, dq, dwk, dwv, dwq, dbk, dbv, dbq, \
-                None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None, None
 
 
 def _neighborhood_attention_s2_torch(k: torch.Tensor, v: torch.Tensor, q: torch.Tensor,
@@ -596,7 +599,7 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
             dbq = None
 
         return dk, dv, dq, dwk, dwv, dwq, dbk, dbv, dbq, \
-                None, None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None, None, None
 
 
 def _neighborhood_attention_s2_cuda(k: torch.Tensor, v: torch.Tensor, q: torch.Tensor,
@@ -608,4 +611,4 @@ def _neighborhood_attention_s2_cuda(k: torch.Tensor, v: torch.Tensor, q: torch.T
 
     return _NeighborhoodAttentionS2Cuda.apply(k, v, q, wk, wv, wq, bk, bv, bq,
                                               quad_weights, col_idx, row_off, max_psi_nnz,
-                                              nh, nlon_in, nlat_out, nlon_out)
+                                              nh, nlon_in, nlat_out, nlon_out, start_idx, end_idx)

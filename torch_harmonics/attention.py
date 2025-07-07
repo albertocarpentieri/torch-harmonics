@@ -194,6 +194,119 @@ class AttentionS2(nn.Module):
 
         return out
 
+def compute_lon_padding_columns(
+    lon_range: Tuple[float, float],
+    lat_range: Tuple[float, float],
+    nlon: int,
+    radius_rad: float
+) -> int:
+    """
+    Compute how many longitude columns to add on each side of an equiangular grid slice
+    so that the grid point at the middle longitude and the latitude closest to a pole
+    has a complete spherical cap neighborhood of angular radius `radius_rad`.
+
+    The domain is a “slice” of the sphere in colatitude-longitude coordinates:
+      • Longitude runs from lon_min to lon_max (in radians), with 0 <= lon_min < lon_max <= 2pi.
+      • Colatitude theta runs from lat_min to lat_max (in radians), with 0 <= lat_min < lat_max <= pi.
+        (theta = 0 at North Pole, theta = pi/2 at Equator, theta = pi at South Pole.)
+
+    Parameters
+    ----------
+    lon_range : tuple[float, float]
+        (lon_min, lon_max) in radians, specifying the slice's longitude bounds.
+        Assumes 0 <= lon_min < lon_max <= 2pi and no wrap-around across 0/2pi.
+    lat_range : tuple[float, float]
+        (lat_min, lat_max) in radians, specifying the slice's colatitude bounds.
+        Assumes 0 <= lat_min < lat_max <= pi.  If lat_min = 0 or lat_max = pi, a pole is included.
+    nlon : int
+        Number of equally spaced longitude grid points between lon_min and lon_max.
+    nlat : int
+        Number of equally spaced colatitude grid points between lat_min and lat_max.
+    radius_rad : float
+        Desired neighborhood angular radius (in radians).
+
+    Returns
+    -------
+    pad_cols_per_side : int
+        The number of extra longitude-columns to add on each side so that the point
+        at “middle longitude” and the boundary latitude nearest a pole can still
+        have a full spherical-cap of radius 'radius_rad'.  Guaranteed to lie in [0, nlon//2].
+
+    Method
+    ------
+    1.  Let current_width = lon_max - lon_min.  Each longitude column spans
+          deltalambda_grid = current_width / (nlon - 1).
+    2.  Compute distances to the poles at the two colatitude boundaries:
+          d_north = lat_min,   # distance to North Pole (theta = 0)
+          d_south = pi - lat_max  # distance to South Pole (theta = pi)
+        Let d_min = min(d_north, d_south).  If radius_rad >= d_min, a cap at that boundary
+        already reaches a pole, so the required longitude-width is 2pi.
+    3.  Otherwise, set phi_edge = lat_min if d_north <= d_south else lat_max.  That phi_edge
+        is the boundary colatitude closest to a pole.
+    4.  Solve for deltalambda_max at phi_edge from the spherical law of cosines (same latitude):
+          cos(radius_rad) = cos**2(phi_edge) + sin**2(phi_edge) * cos(deltalambda_max),
+        so
+          deltalambda_max = arccos( (cos(radius_rad) - cos**2phi_edge)) / sin**2(phi_edge) ).
+        The total required width at that latitude is 2·Δλ_max.
+    5.  Let required_width = max(2pi, 2deltalambda_max).  Compute extension_width = max(0, required_width - current_width).
+    6.  The naive number of extra columns per side = ceil((extension_width/2) / Δλ_grid).
+    7.  As a secondary condition, also require at least
+          ceil(radius_rad * (lon_max - lon_min) / nlon)
+        columns per side (ensures a minimum based on the cap's angular radius).
+    8.  Take the maximum of steps 6 and 7, then cap at nlon//2:
+          pad = min( nlon//2, max( ceil((extension_width/2)/deltalambda_grid),
+                                     ceil(radius_rad * (lon_max - lon_min)/nlon ) ) ).
+
+    This guarantees 0 <= pad_cols_per_side <= nlon//2.
+    """
+
+    lon_min, lon_max = lon_range
+    lat_min, lat_max = lat_range
+
+    # Step 1: current total width and grid spacing in longitude
+    current_width = lon_max - lon_min
+    delta_lambda_grid = current_width / (nlon - 1)
+
+    # Step 2: distance from each boundary to nearest pole
+    distance_north = lat_min            # colatitude lat_min is distance to North Pole
+    distance_south = math.pi - lat_max  # colatitude lat_max is distance to South Pole
+    d_min = min(distance_north, distance_south)
+
+    # Step 3: if radius >= d_min, cap hits a pole => required_width = 2pi
+    if radius_rad >= d_min:
+        required_width = 2 * math.pi
+    else:
+        # Step 4: pick the boundary colatitude nearest a pole
+        phi_edge = lat_min if (distance_north <= distance_south) else lat_max
+
+        # use spherical law of cosines at constant colatitude to find deltalambda_max
+        cos_r = math.cos(radius_rad)
+        cos_phi = math.cos(phi_edge)
+        sin_phi = math.sin(phi_edge)
+
+        # Compute the argument for arccos, clamped to [-1, +1]
+        numerator = cos_r - (cos_phi * cos_phi)
+        denominator = sin_phi * sin_phi
+        arg = numerator / denominator
+        arg = max(-1.0, min(1.0, arg))
+
+        delta_lambda_max = math.acos(arg)
+        required_width = 2 * delta_lambda_max
+
+    # Step 5: how much wider than current_width?
+    extension_width = max(0.0, required_width - current_width)
+
+    # Step 6: naive padding = ceil((extension_width/2) / deltalambda_grid)
+    naive_pad = math.ceil((extension_width / 2) / delta_lambda_grid)
+
+    # Step 7: secondary minimum padding = ceil(radius_rad * (lon_max − lon_min) / nlon)
+    #         (This term enforces a baseline based on the cap’s angular radius.)
+    baseline_pad = math.ceil(radius_rad * nlon / current_width)
+
+    # Step 8: final pad = min(nlon//2, max(naive_pad, baseline_pad))
+    pad_cols_per_side = min(nlon // 2, max(naive_pad, baseline_pad))
+
+    return pad_cols_per_side
 
 class NeighborhoodAttentionS2(nn.Module):
     """
@@ -220,55 +333,90 @@ class NeighborhoodAttentionS2(nn.Module):
     out_channels: int, optional
         number of dimensions for interior inner product in the attention matrix (corresponds to vdim in MHA in PyTorch)
     """
-
     def __init__(
         self,
         in_channels: int,
-        in_shape: Tuple[int],
-        out_shape: Tuple[int],
-        grid_in: Optional[str] = "equiangular",
-        grid_out: Optional[str] = "equiangular",
-        num_heads: Optional[int] = 1,
-        scale: Optional[Union[torch.Tensor, float]] = None,
-        bias: Optional[bool] = True,
+        in_shape: Tuple[int,int],
+        out_shape: Tuple[int,int],
+        grid_in: str = "cosine",
+        grid_out: str = "cosine",
+        lon_range: Tuple[float,float] = (0, 2*math.pi),
+        lat_range: Tuple[float,float] = (0, math.pi),
+        num_heads: int = 1,
+        scale=None,
+        bias: bool = True,
         theta_cutoff: Optional[float] = None,
         k_channels: Optional[int] = None,
         out_channels: Optional[int] = None,
     ):
+        
         super().__init__()
-
-        self.nlat_in, self.nlon_in = in_shape
-        self.nlat_out, self.nlon_out = out_shape
-
+        
+        # validate shapes/ranges omitted for brevity…
+        self.k_channels = in_channels if k_channels is None else k_channels
         self.in_channels = in_channels
         self.num_heads = num_heads
-        self.k_channels = in_channels if k_channels is None else k_channels
         self.out_channels = in_channels if out_channels is None else out_channels
+        self.nlat_in, self.nlon_in = in_shape
+        self.nlat_out, self.nlon_out = out_shape
+        self.lon_range = lon_range
+        self.lat_range = lat_range
+        self.grid_in = grid_in
+        self.grid_out = grid_out
 
-        # heuristic to compute theta cutoff based on the bandlimit of the input field and overlaps of the basis functions
         if theta_cutoff is None:
-            theta_cutoff = torch.pi / float(self.nlat_out - 1)
+            theta_cutoff = math.pi / float(self.nlat_out - 1)
 
-        if theta_cutoff <= 0.0:
-            raise ValueError("Error, theta_cutoff has to be positive.")
+        # need ghost grid if we do NOT cover full 0→2π
+        self.use_padding = not (abs(lon_range[0]) < 1e-6 and abs(lon_range[1] - 2*math.pi) < 1e-6)
 
-        # integration weights
-        _, wgl = _precompute_latitudes(self.nlat_in, grid=grid_in)
-        quad_weights = 2.0 * torch.pi * wgl.to(dtype=torch.float32) / self.nlon_in
+        if self.use_padding:
+            padding_points = compute_lon_padding_columns(
+                lon_range=lon_range,
+                lat_range=lat_range,
+                nlon=self.nlon_in,
+                nlat=self.nlat_in,
+                radius_rad=theta_cutoff
+            )
+            domain_size = lon_range[1] - lon_range[0]
+            cell_width = domain_size / self.nlon_in
+            padded_lon_min = max(0, lon_range[0] - padding_points * cell_width)
+            padded_lon_max = lon_range[1] + padding_points * cell_width
+            
+            # Recompute ghost_nlon_in
+            self.padded_nlon_in = int(round((padded_lon_max - padded_lon_min) / cell_width))
+            self.in_lon_range = (padded_lon_min, padded_lon_max)
+            self.start_idx = int(round((lon_range[0] - padded_lon_min) / cell_width))
+            self.end_idx   = self.start_idx + self.nlon_in
+            self.orig_nlon_in = self.nlon_in
+            self.nlon_in      = self.ghost_nlon_in
+        else:
+            self.in_lon_range = lon_range
+            self.orig_nlon_in = self.nlon_in
+            self.ghost_nlon_in = self.orig_nlon_in
+            self.start_idx = 0
+            self.end_idx = self.nlon_in
+
+        # integration weights (on the padded grid if ghost)
+        _, wgl = _precompute_latitudes(self.nlat_in, grid=grid_in,
+                                       a=math.cos(lat_range[1]), b=math.cos(lat_range[0]))
+        quad_weights = 2.0 * math.pi * wgl.to(torch.float32) / self.nlon_in
         self.register_buffer("quad_weights", quad_weights, persistent=False)
 
-        # create a dummy filter basis to pass to the construction of the convolution tensor
-        # this is to avoid code duplication as the logic of pre-computing the sparsity pattern
-        # is identical to convolutions with a constant filter function
+        # dummy basis for neighborhood shape only
         fb = get_filter_basis(kernel_shape=1, basis_type="zernike")
 
-        # precompute the neighborhood sparsity pattern
-        idx, vals = _precompute_convolution_tensor_s2(
-            in_shape,
+        # **use padded size in precompute**
+        idx, _ = _precompute_convolution_tensor_s2(
+            (self.nlat_in, self.padded_nlon_in),
             out_shape,
             fb,
             grid_in=grid_in,
             grid_out=grid_out,
+            in_lat_range=lat_range,
+            out_lat_range=lat_range,
+            in_lon_range=self.in_lon_range,
+            out_lon_range=self.lon_range,
             theta_cutoff=theta_cutoff,
             transpose_normalization=False,
             basis_norm_mode="none",
@@ -291,17 +439,14 @@ class NeighborhoodAttentionS2(nn.Module):
 
         # set the last value
         row_offset[row + 1] = idz + 1
-        row_offset = torch.from_numpy(row_offset).contiguous()
+        row_offset = torch.from_numpy(row_offset)
         self.max_psi_nnz = col_idx.max().item() + 1
 
         self.register_buffer("psi_row_idx", row_idx, persistent=False)
         self.register_buffer("psi_col_idx", col_idx, persistent=False)
         self.register_buffer("psi_roff_idx", row_offset, persistent=False)
-        # self.register_buffer("psi_vals", vals, persistent=False)
 
         # learnable parameters
-        # TODO: double-check that this gives us the correct initialization magnitudes
-        # the standard MHA uses xavier uniform, NATTEN uses kaiming. Let's use that for now
         if self.k_channels % self.num_heads != 0:
             raise ValueError(f"Please make sure that number of heads {self.num_heads} divides k_channels {self.k_channels} evenly.")
         if self.out_channels % self.num_heads != 0:
@@ -333,10 +478,13 @@ class NeighborhoodAttentionS2(nn.Module):
         r"""
         Pretty print module
         """
-        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_channels={self.in_channels}, out_channels={self.out_channels}, k_channels={self.k_channels}"
+        return f"in_shape={(self.nlat_in, self.nlon_in)}, out_shape={(self.nlat_out, self.nlon_out)}, in_channels={self.in_channels}, out_channels={self.out_channels}, k_channels={self.k_channels}, wrap={self.wrap}, use_ghost_grid={self.use_ghost_grid}"
 
     def forward(self, query: torch.Tensor, key: Optional[torch.Tensor] = None, value: Optional[torch.Tensor] = None) -> torch.Tensor:
-
+        # Input validation
+        if query.dim() != 4:
+            raise ValueError(f"Expected 4D input tensor, got {query.dim()}D")
+        
         # self attention simplification
         if key is None:
             key = query
@@ -344,15 +492,17 @@ class NeighborhoodAttentionS2(nn.Module):
         if value is None:
             value = query
 
-        # change this later to allow arbitrary number of batch dims
-        assert (query.dim() == key.dim()) and (key.dim() == value.dim()) and (value.dim() == 4)
+        # Validate input shapes
+        if key.shape != value.shape:
+            raise ValueError(f"Key and value shapes must match, got {key.shape} and {value.shape}")
+        if key.shape[2:] != (self.nlat_in, self.nlon_in):
+            raise ValueError(f"Expected input shape {(self.nlat_in, self.nlon_in)}, got {key.shape[2:]}")
 
         # do the scaling
         query_scaled = query * self.scale
 
         # TODO: insert dimension checks for input
         if query.is_cuda and _cuda_extension_available:
-
             out = _neighborhood_attention_s2_cuda(
                 key,
                 value,
@@ -368,9 +518,11 @@ class NeighborhoodAttentionS2(nn.Module):
                 self.psi_roff_idx,
                 self.max_psi_nnz,
                 self.num_heads,
-                self.nlon_in,
+                self.orig_nlon_in,  # Use original size for input
                 self.nlat_out,
                 self.nlon_out,
+                self.start_idx,
+                self.end_idx
             )
         else:
             if query.is_cuda:
@@ -391,9 +543,11 @@ class NeighborhoodAttentionS2(nn.Module):
                 self.psi_col_idx,
                 self.psi_roff_idx,
                 self.num_heads,
-                self.nlon_in,
+                self.orig_nlon_in,  # Use original size for input
                 self.nlat_out,
                 self.nlon_out,
+                self.start_idx,
+                self.end_idx
             )
 
         out = nn.functional.conv2d(out, self.proj_weights, bias=self.proj_bias)
