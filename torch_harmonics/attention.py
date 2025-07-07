@@ -383,17 +383,17 @@ class NeighborhoodAttentionS2(nn.Module):
             padded_lon_min = max(0, lon_range[0] - padding_points * cell_width)
             padded_lon_max = lon_range[1] + padding_points * cell_width
             
-            # Recompute ghost_nlon_in
+            # Recompute padded_nlon_in
             self.padded_nlon_in = int(round((padded_lon_max - padded_lon_min) / cell_width))
             self.in_lon_range = (padded_lon_min, padded_lon_max)
             self.start_idx = int(round((lon_range[0] - padded_lon_min) / cell_width))
             self.end_idx   = self.start_idx + self.nlon_in
             self.orig_nlon_in = self.nlon_in
-            self.nlon_in      = self.ghost_nlon_in
+            self.nlon_in      = self.padded_nlon_in
         else:
             self.in_lon_range = lon_range
             self.orig_nlon_in = self.nlon_in
-            self.ghost_nlon_in = self.orig_nlon_in
+            self.padded_nlon_in = self.orig_nlon_in
             self.start_idx = 0
             self.end_idx = self.nlon_in
 

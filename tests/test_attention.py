@@ -127,6 +127,8 @@ class TestNeighborhoodAttentionS2(unittest.TestCase):
             model_ref.nlon_in,
             model_ref.nlat_out,
             model_ref.nlon_out,
+            model_ref.start_idx,
+            model_ref.end_idx,
         )
         out_ref = nn.functional.conv2d(out_ref, model_ref.proj_weights, bias=model_ref.proj_bias)
         out = model(inputs["q"], inputs["k"], inputs["v"])
