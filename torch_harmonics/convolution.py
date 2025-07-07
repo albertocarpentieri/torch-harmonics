@@ -144,7 +144,8 @@ def _precompute_convolution_tensor_s2(
     grid_out: Optional[str] = "cosine",
     in_lon_range: Optional[tuple] = (0, 2 * math.pi),
     out_lon_range: Optional[tuple] = (0, 2 * math.pi),
-    lat_range: Optional[tuple] = (0, math.pi),
+    in_lat_range: Optional[tuple] = (0, math.pi),
+    out_lat_range: Optional[tuple] = (0, math.pi),
     theta_cutoff: Optional[float] = 0.01 * math.pi,
     theta_eps: Optional[float] = 1e-3,
     transpose_normalization: Optional[bool] = False,
@@ -171,8 +172,8 @@ def _precompute_convolution_tensor_s2(
     nlat_out, nlon_out = out_shape
 
     # precompute latitudes & weights
-    lats_in, win = _precompute_latitudes(nlat_in, grid=grid_in, a=math.cos(lat_range[1]), b=math.cos(lat_range[0]))
-    lats_out, wout = _precompute_latitudes(nlat_out, grid=grid_out, a=math.cos(lat_range[1]), b=math.cos(lat_range[0]))
+    lats_in, win = _precompute_latitudes(nlat_in, grid=grid_in, a=math.cos(in_lat_range[1]), b=math.cos(in_lat_range[0]))
+    lats_out, wout = _precompute_latitudes(nlat_out, grid=grid_out, a=math.cos(out_lat_range[1]), b=math.cos(out_lat_range[0]))
     lons_in = _precompute_longitudes(nlon_in, a=in_lon_range[0], b=in_lon_range[1])
     lons_out = _precompute_longitudes(nlon_out, a=out_lon_range[0], b=out_lon_range[1])
 
