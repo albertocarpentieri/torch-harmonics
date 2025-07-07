@@ -234,7 +234,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> s2_attention_bwd_dkvq_cuda(at::Te
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     // Transpose to [batch, ho, wo, channel]
-    nvtxRangePush("s2_attention_bwd_dkvq_kernel_mbT permute inputs");
+    // nvtxRangePush("s2_attention_bwd_dkvq_kernel_mbT permute inputs");
     // auto* permute_timer = new ScopeTimer("permute inputs");
 
     // extract dtype
@@ -257,14 +257,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> s2_attention_bwd_dkvq_cuda(at::Te
 
     // cudaDeviceSynchronize();
     // delete permute_timer;
-    nvtxRangePop();
+    // nvtxRangePop();
 
-    nvtxRangePush("s2_attention_bwd_dkvq_kernel_mbT output allocation & zero");
+    // nvtxRangePush("s2_attention_bwd_dkvq_kernel_mbT output allocation & zero");
     auto dydk = torch::zeros_like(qyP);
     auto dydv = torch::zeros_like(qyP);
     auto dydq = torch::zeros_like(qyP);
     // print strdie of dydkP, dydvP, dydqP
-    nvtxRangePop();
+    // nvtxRangePop();
 
     size_t uo_num_channels = kx.size(1);
     const int batch_size = kx.size(0);
