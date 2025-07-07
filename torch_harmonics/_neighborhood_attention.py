@@ -49,7 +49,7 @@ except ImportError as err:
 # and https://alexdremov.me/understanding-flash-attention-writing-the-algorithm-from-scratch-in-triton/
 def _neighborhood_attention_s2_fwd_torch(kx: torch.Tensor, vx: torch.Tensor, qy: torch.Tensor,
                                             quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                                            nlon_in: int, nlat_out: int, nlon_out: int) -> torch.Tensor:
+                                            nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int) -> torch.Tensor:
 
 
     # prepare result tensor
@@ -65,7 +65,6 @@ def _neighborhood_attention_s2_fwd_torch(kx: torch.Tensor, vx: torch.Tensor, qy:
 
             alpha_sum = torch.zeros((y.shape[0],), dtype=y.dtype, device=y.device)
             qdotk_max = torch.zeros((y.shape[0],), dtype=y.dtype, device=y.device)
-
             for idz in range(zstart, zend):
                 nz_col_idx = col_idx[idz]
 
@@ -73,8 +72,10 @@ def _neighborhood_attention_s2_fwd_torch(kx: torch.Tensor, vx: torch.Tensor, qy:
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi + wo) % nlon_in
-
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
                 # compute correlation & softmax numerator
                 q_ho_wo = qy[:, :, ho, wo]
                 k_hi_wip = kx[:, :, hi, wip]
@@ -101,7 +102,7 @@ def _neighborhood_attention_s2_fwd_torch(kx: torch.Tensor, vx: torch.Tensor, qy:
 # provided as a reference for CUDA & other hand-written gradients
 def _neighborhood_attention_s2_bwd_dv_torch(kx: torch.Tensor, vx: torch.Tensor, qy: torch.Tensor, dy: torch.Tensor,
                                             quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                                            nlon_in: int, nlat_out: int, nlon_out: int):
+                                            nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int):
 
     # shapes:
     # input
@@ -132,7 +133,10 @@ def _neighborhood_attention_s2_bwd_dv_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi+wo) % nlon_in
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
 
                 # compute correlation & softmax numerator
                 q_ho_wo = qy[:, :, ho, wo]
@@ -148,7 +152,10 @@ def _neighborhood_attention_s2_bwd_dv_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi+wo) % nlon_in
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
                 alpha_nz[:,idz-zstart] = torch.exp(qdotk_nz[:,idz-zstart] - qdotk_max) * quad_weights[hi]
                 alpha_sum[:] += alpha_nz[:,idz-zstart]
 
@@ -159,7 +166,10 @@ def _neighborhood_attention_s2_bwd_dv_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi+wo) % nlon_in
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
                 dvx[:,:,hi, wip] += (alpha_nz[:, None, idz-zstart] / alpha_sum[:, None]) * dy[:,:,ho,wo]
 
     return dvx
@@ -169,7 +179,7 @@ def _neighborhood_attention_s2_bwd_dv_torch(kx: torch.Tensor, vx: torch.Tensor, 
 # provided as a reference for CUDA & other hand-written gradients
 def _neighborhood_attention_s2_bwd_dk_torch(kx: torch.Tensor, vx: torch.Tensor, qy: torch.Tensor, dy: torch.Tensor,
                                             quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                                            nlon_in: int, nlat_out: int, nlon_out: int):
+                                            nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int):
 
     # shapes:
     # input
@@ -201,7 +211,10 @@ def _neighborhood_attention_s2_bwd_dk_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hj = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wj = nz_col_idx % nlon_in
-                wjp = (wj+wo) % nlon_in
+                wjp = (wj + wo - (nlon_out // 2)) % nlon_in
+                if wjp < start_idx or wjp >= end_idx:
+                    continue
+                wjp = wjp - start_idx
 
                 # compute correlation & softmax numerator
                 q_ho_wo = qy[:, :, ho, wo]
@@ -217,7 +230,10 @@ def _neighborhood_attention_s2_bwd_dk_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hj = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wj = nz_col_idx % nlon_in
-                wjp = (wj+wo) % nlon_in
+                wjp = (wj + wo - (nlon_out // 2)) % nlon_in
+                if wjp < start_idx or wjp >= end_idx:
+                    continue
+                wjp = wjp - start_idx
 
                 alpha[:, idz-zstart] = torch.exp(qdotk_nz[:,idz-zstart] - qdotk_max) * quad_weights[hj]
                 alpha_sum[:] += alpha[:, idz-zstart]
@@ -237,7 +253,10 @@ def _neighborhood_attention_s2_bwd_dk_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi+wo) % nlon_in
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
 
                 # compute correlation & softmax numerator
                 gdotv = torch.sum(dy[:,:,ho, wo] * vx[:,:,hi, wip], dim=1)
@@ -250,7 +269,7 @@ def _neighborhood_attention_s2_bwd_dk_torch(kx: torch.Tensor, vx: torch.Tensor, 
 # provided as a reference for CUDA & other hand-written gradients
 def _neighborhood_attention_s2_bwd_dq_torch(kx: torch.Tensor, vx: torch.Tensor, qy: torch.Tensor, dy: torch.Tensor,
                                             quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                                            nlon_in: int, nlat_out: int, nlon_out: int):
+                                            nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int):
 
     # shapes:
     # input
@@ -285,7 +304,10 @@ def _neighborhood_attention_s2_bwd_dq_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi+wo) % nlon_in
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
 
                 idz_i = idz-zstart
 
@@ -303,7 +325,10 @@ def _neighborhood_attention_s2_bwd_dq_torch(kx: torch.Tensor, vx: torch.Tensor, 
                 hi = nz_col_idx // nlon_in
                 # account for output shift and ensure positive index due to circular condition
                 wi = nz_col_idx % nlon_in
-                wip = (wi+wo) % nlon_in
+                wip = (wi + wo - (nlon_out // 2)) % nlon_in
+                if wip < start_idx or wip >= end_idx:
+                    continue
+                wip = wip - start_idx
 
                 q_ho_wo = qy[:, :, ho, wo]
                 k_hi_wi = kx[:, :, hi, wip]
@@ -328,13 +353,15 @@ class _NeighborhoodAttentionS2(torch.autograd.Function):
                 wk: torch.Tensor, wv: torch.Tensor, wq: torch.Tensor,
                 bk: Union[torch.Tensor, None], bv: Union[torch.Tensor, None], bq: Union[torch.Tensor, None],
                 quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                nh: int, nlon_in: int, nlat_out: int, nlon_out: int):
+                nh: int, nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int):
 
         ctx.save_for_backward(col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq)
         ctx.nh = nh
         ctx.nlon_in = nlon_in
         ctx.nlat_out = nlat_out
         ctx.nlon_out = nlon_out
+        ctx.start_idx = start_idx
+        ctx.end_idx = end_idx
 
         kw = F.conv2d(k, weight=wk, bias=bk)
         vw = F.conv2d(v, weight=wv, bias=bv)
@@ -364,7 +391,7 @@ class _NeighborhoodAttentionS2(torch.autograd.Function):
     @staticmethod
     @custom_bwd(device_type="cpu")
     def backward(ctx, grad_output):
-        col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq = ctx.saved_tensors
+        col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq, start_idx, end_idx = ctx.saved_tensors
         nh = ctx.nh
         nlon_in = ctx.nlon_in
         nlat_out = ctx.nlat_out
@@ -387,17 +414,20 @@ class _NeighborhoodAttentionS2(torch.autograd.Function):
         dvw = _neighborhood_attention_s2_bwd_dv_torch(kw, vw, qw, grad_output,
                                                       quad_weights,
                                                       col_idx, row_off,
-                                                      nlon_in, nlat_out, nlon_out)
+                                                      nlon_in, nlat_out, nlon_out,
+                                                      start_idx, end_idx)
 
         dkw = _neighborhood_attention_s2_bwd_dk_torch(kw, vw, qw, grad_output,
                                                       quad_weights,
                                                       col_idx, row_off,
-                                                      nlon_in, nlat_out, nlon_out)
+                                                      nlon_in, nlat_out, nlon_out,
+                                                      start_idx, end_idx)
 
         dqw = _neighborhood_attention_s2_bwd_dq_torch(kw, vw, qw, grad_output,
                                                       quad_weights,
                                                       col_idx, row_off,
-                                                      nlon_in, nlat_out, nlon_out)
+                                                      nlon_in, nlat_out, nlon_out,
+                                                      start_idx, end_idx)
 
         # reshape again
         _, C, H, W = dkw.shape
@@ -442,11 +472,11 @@ def _neighborhood_attention_s2_torch(k: torch.Tensor, v: torch.Tensor, q: torch.
                                      bk: Union[torch.Tensor, None], bv: Union[torch.Tensor, None],
                                      bq: Union[torch.Tensor, None], quad_weights: torch.Tensor,
                                      col_idx: torch.Tensor, row_off: torch.Tensor,
-                                     nh: int, nlon_in: int, nlat_out: int, nlon_out: int) -> torch.Tensor:
+                                     nh: int, nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int) -> torch.Tensor:
 
     return _NeighborhoodAttentionS2.apply(k, v, q, wk, wv, wq, bk, bv, bq,
                                           quad_weights, col_idx, row_off,
-                                          nh, nlon_in, nlat_out, nlon_out)
+                                          nh, nlon_in, nlat_out, nlon_out, start_idx, end_idx)
 
 
 class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
@@ -457,7 +487,7 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
                 wk: torch.Tensor, wv: torch.Tensor, wq: torch.Tensor,
                 bk: Union[torch.Tensor, None], bv: Union[torch.Tensor, None], bq: Union[torch.Tensor, None],
                 quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                max_psi_nnz: int, nh: int, nlon_in: int, nlat_out: int, nlon_out: int):
+                max_psi_nnz: int, nh: int, nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int):
 
         ctx.save_for_backward(col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq)
         ctx.nh = nh
@@ -465,6 +495,8 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
         ctx.nlon_in = nlon_in
         ctx.nlat_out = nlat_out
         ctx.nlon_out = nlon_out
+        ctx.start_idx = start_idx 
+        ctx.end_idx = end_idx
 
         kw = F.conv2d(k, weight=wk, bias=bk)
         vw = F.conv2d(v, weight=wv, bias=bv)
@@ -486,7 +518,8 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
 
         output = attention_cuda_extension.forward(kw, vw, qw, quad_weights,
                                                   col_idx, row_off,
-                                                  nlon_in, nlat_out, nlon_out)
+                                                  nlon_in, nlat_out, nlon_out,
+                                                  start_idx, end_idx)
 
         _, C, H, W = output.shape
         output = output.reshape(B, -1, H, W)
@@ -505,6 +538,8 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
         nlon_in = ctx.nlon_in
         nlat_out = ctx.nlat_out
         nlon_out = ctx.nlon_out
+        start_idx = ctx.start_idx 
+        end_idx = ctx.end_idx
 
         kw = F.conv2d(k, weight=wk, bias=bk)
         vw = F.conv2d(v, weight=wv, bias=bv)
@@ -523,7 +558,8 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
         dkw,dvw,dqw = attention_cuda_extension.backward_dkvq(kw, vw, qw, grad_output,
                                                              quad_weights,
                                                              col_idx, row_off,
-                                                             nlon_in, nlat_out, nlon_out)
+                                                             nlon_in, nlat_out, nlon_out,
+                                                             start_idx, end_idx)
 
         # reshape again
         _, C, H, W = dkw.shape
@@ -568,7 +604,7 @@ def _neighborhood_attention_s2_cuda(k: torch.Tensor, v: torch.Tensor, q: torch.T
                                     bk: Union[torch.Tensor, None], bv: Union[torch.Tensor, None],
                                     bq: Union[torch.Tensor, None], quad_weights: torch.Tensor,
                                     col_idx: torch.Tensor, row_off: torch.Tensor, max_psi_nnz: int,
-                                    nh: int, nlon_in: int, nlat_out: int, nlon_out: int) -> torch.Tensor:
+                                    nh: int, nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int) -> torch.Tensor:
 
     return _NeighborhoodAttentionS2Cuda.apply(k, v, q, wk, wv, wq, bk, bv, bq,
                                               quad_weights, col_idx, row_off, max_psi_nnz,
