@@ -196,6 +196,9 @@ class TestNeighborhoodAttentionS2(unittest.TestCase):
         out = model(inputs["q"], inputs["k"], inputs["v"])
 
         # Check forward equivalence
+        print()
+        print("MAX DIFFERENCE: ", torch.max(torch.abs(out - out_ref)))
+        print()
         self.assertTrue(torch.allclose(out, out_ref, atol=atol, rtol=rtol), "Forward outputs differ between torch reference and custom implementation")
 
         # Backward passes

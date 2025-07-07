@@ -521,8 +521,6 @@ class NeighborhoodAttentionS2(nn.Module):
                 self.orig_nlon_in,  # Use original size for input
                 self.nlat_out,
                 self.nlon_out,
-                self.start_idx,
-                self.end_idx
             )
         else:
             if query.is_cuda:

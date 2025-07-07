@@ -490,7 +490,7 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
                 wk: torch.Tensor, wv: torch.Tensor, wq: torch.Tensor,
                 bk: Union[torch.Tensor, None], bv: Union[torch.Tensor, None], bq: Union[torch.Tensor, None],
                 quad_weights: torch.Tensor, col_idx: torch.Tensor, row_off: torch.Tensor,
-                max_psi_nnz: int, nh: int, nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int):
+                max_psi_nnz: int, nh: int, nlon_in: int, nlat_out: int, nlon_out: int):
 
         ctx.save_for_backward(col_idx, row_off, quad_weights, k, v, q, wk, wv, wq, bk, bv, bq)
         ctx.nh = nh
@@ -498,8 +498,6 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
         ctx.nlon_in = nlon_in
         ctx.nlat_out = nlat_out
         ctx.nlon_out = nlon_out
-        ctx.start_idx = start_idx 
-        ctx.end_idx = end_idx
 
         kw = F.conv2d(k, weight=wk, bias=bk)
         vw = F.conv2d(v, weight=wv, bias=bv)
@@ -521,8 +519,7 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
 
         output = attention_cuda_extension.forward(kw, vw, qw, quad_weights,
                                                   col_idx, row_off,
-                                                  nlon_in, nlat_out, nlon_out,
-                                                  start_idx, end_idx)
+                                                  nlon_in, nlat_out, nlon_out)
 
         _, C, H, W = output.shape
         output = output.reshape(B, -1, H, W)
@@ -541,8 +538,6 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
         nlon_in = ctx.nlon_in
         nlat_out = ctx.nlat_out
         nlon_out = ctx.nlon_out
-        start_idx = ctx.start_idx 
-        end_idx = ctx.end_idx
 
         kw = F.conv2d(k, weight=wk, bias=bk)
         vw = F.conv2d(v, weight=wv, bias=bv)
@@ -561,8 +556,7 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
         dkw,dvw,dqw = attention_cuda_extension.backward_dkvq(kw, vw, qw, grad_output,
                                                              quad_weights,
                                                              col_idx, row_off,
-                                                             nlon_in, nlat_out, nlon_out,
-                                                             start_idx, end_idx)
+                                                             nlon_in, nlat_out, nlon_out)
 
         # reshape again
         _, C, H, W = dkw.shape
@@ -599,7 +593,7 @@ class _NeighborhoodAttentionS2Cuda(torch.autograd.Function):
             dbq = None
 
         return dk, dv, dq, dwk, dwv, dwq, dbk, dbv, dbq, \
-                None, None, None, None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None
 
 
 def _neighborhood_attention_s2_cuda(k: torch.Tensor, v: torch.Tensor, q: torch.Tensor,
@@ -607,8 +601,8 @@ def _neighborhood_attention_s2_cuda(k: torch.Tensor, v: torch.Tensor, q: torch.T
                                     bk: Union[torch.Tensor, None], bv: Union[torch.Tensor, None],
                                     bq: Union[torch.Tensor, None], quad_weights: torch.Tensor,
                                     col_idx: torch.Tensor, row_off: torch.Tensor, max_psi_nnz: int,
-                                    nh: int, nlon_in: int, nlat_out: int, nlon_out: int, start_idx: int, end_idx: int) -> torch.Tensor:
+                                    nh: int, nlon_in: int, nlat_out: int, nlon_out: int) -> torch.Tensor:
 
     return _NeighborhoodAttentionS2Cuda.apply(k, v, q, wk, wv, wq, bk, bv, bq,
                                               quad_weights, col_idx, row_off, max_psi_nnz,
-                                              nh, nlon_in, nlat_out, nlon_out, start_idx, end_idx)
+                                              nh, nlon_in, nlat_out, nlon_out)
