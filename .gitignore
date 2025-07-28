@@ -2,3 +2,5 @@
 __pycache__
 *.so
 checkpoints
+*.egg-info
+build
