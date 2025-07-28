@@ -348,7 +348,7 @@ def main(
     local_rank = 0
     logging = True
     if ddp:
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="gloo")
         world_size = dist.get_world_size()
         local_rank = dist.get_rank() % torch.cuda.device_count()
         logging = dist.get_rank() == 0
@@ -431,19 +431,25 @@ def main(
 
     # get baseline model registry
     baseline_models = get_baseline_models(img_size=img_size, in_chans=in_channels, out_chans=out_channels)
+    print(img_size)
 
     # specify which models to train here
     models = [
-        "transformer_sc2_layers4_e128",
-        "s2transformer_sc2_layers4_e128",
-        "ntransformer_sc2_layers4_e128",
-        "s2ntransformer_sc2_layers4_e128",
-        "segformer_sc2_layers4_e128",
-        "s2segformer_sc2_layers4_e128",
-        "nsegformer_sc2_layers4_e128",
-        "s2nsegformer_sc2_layers4_e128",
-        "sfno_sc2_layers4_e32",
-        "lsno_sc2_layers4_e32",
+        # "transformer_sc2_layers4_e128",
+        # "s2transformer_sc2_layers4_e128",
+        # "ntransformer_sc2_layers4_e128",
+        # "s2ntransformer_sc2_layers4_e128",
+        # "segformer_sc2_layers4_e128",
+        # "s2segformer_sc2_layers4_e128",
+        # "nsegformer_sc2_layers4_e128",
+        # "s2nsegformer_sc2_layers4_e128",
+        # "sfno_sc2_layers4_e32",
+        # "lsno_sc2_layers4_e32",
+        # "sunet_depth3_e16",
+        # "sunet_depth3_e32",
+        # "sunet_depth4_e16",
+        # "sunet_depth4_e32",
+        "sunet_depth2_e64_pf2",
     ]
     models = {k: baseline_models[k] for k in models}
 

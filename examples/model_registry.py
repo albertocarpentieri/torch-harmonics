@@ -36,6 +36,7 @@ from functools import partial
 # import baseline models
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from baseline_models import Transformer, UNet, Segformer
+from baseline_models.sphericalunet import SUNet
 from torch_harmonics.examples.models import SphericalFourierNeuralOperator, LocalSphericalNeuralOperator, SphericalTransformer, SphericalUNet, SphericalSegformer
 
 def get_baseline_models(img_size=(128, 256), in_chans=3, out_chans=3, residual_prediction=False, drop_path_rate=0., grid="equiangular"):
@@ -430,6 +431,31 @@ def get_baseline_models(img_size=(128, 256), in_chans=3, out_chans=3, residual_p
             attention_mode="global",
             upsampling_method="pixel_shuffle",
             bias=False
+        ),
+        
+        sunet_depth3_e64 = partial(
+            SUNet,
+            shape=img_size,
+            input_channels=in_chans,
+            output_channels=out_chans,
+            embed_size=64,
+            depth=3,
+            laplacian_type="combinatorial",
+            kernel_size=3,
+            ratio=2,
+            pool_factor=4
+        ),
+        sunet_depth2_e64_pf2 = partial(
+            SUNet,
+            shape=img_size,
+            input_channels=in_chans,
+            output_channels=out_chans,
+            embed_size=64,
+            depth=3,
+            laplacian_type="combinatorial", 
+            kernel_size=5,
+            ratio=2,
+            pool_factor=2
         ),
     )
 
