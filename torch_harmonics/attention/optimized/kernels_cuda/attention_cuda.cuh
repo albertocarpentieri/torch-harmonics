@@ -55,6 +55,19 @@ namespace attention_kernels
                                at::Tensor psi_col_idx, at::Tensor psi_row_off, at::Tensor psi_seg, at::Tensor psi_seg_off,
                                int64_t num_heads, int64_t nlon_in, int64_t nlat_out, int64_t nlon_out);
 
+    // Ragged (HEALPix) variant. Same ABI with the two spatial axes collapsed into a
+    // flat point axis, and the neighbourhood keyed per output point rather than per
+    // output latitude -- see attention_cuda_fwd_ragged.cu.
+    torch::Tensor s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
+                                               at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
+                                               at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
+
+    // Returns (dkx, dvx, dqy) -- see attention_cuda_bwd_ragged.cu.
+    std::tuple<at::Tensor, at::Tensor, at::Tensor>
+    s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor ring_weights,
+                                 at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
+                                 at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
+
     void s2_attention_fwd_ring_step_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor y_acc,
                                          at::Tensor alpha_sum_buf, at::Tensor qdotk_max_buf, at::Tensor quad_weights,
                                          at::Tensor psi_col_idx, at::Tensor psi_row_off, at::Tensor psi_row_idx,

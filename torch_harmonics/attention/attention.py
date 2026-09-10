@@ -39,11 +39,23 @@ from attention_helpers import optimized_kernels_is_available
 
 from torch_harmonics.attention._attention_utils import _build_psi_segments, _check_dtypes_match, _check_extent, _check_ndim
 from torch_harmonics.attention._layout import to_nchw, to_nhwc
+from torch_harmonics.attention.kernels_torch.attention_ragged_torch import _neighborhood_s2_attention_ragged_torch
 from torch_harmonics.attention.kernels_torch.attention_torch import _neighborhood_s2_attention_torch
 from torch_harmonics.attention.optimized.attention_optimized import _neighborhood_s2_attention_optimized
+
+try:
+    from torch_harmonics.attention.optimized.attention_optimized import _neighborhood_s2_attention_ragged_optimized
+except ImportError:
+    # The ragged op is defined only when the compiled extension declares both
+    # forward_ragged and backward_ragged. Importing it unconditionally would make an
+    # extension built before them unimportable, which is the very skew the gate in
+    # attention_optimized.py exists to tolerate -- Python sources come from the tree,
+    # the extension from whenever it was last built.
+    _neighborhood_s2_attention_ragged_optimized = None
 from torch_harmonics.disco.convolution import _precompute_convolution_tensor_s2
 from torch_harmonics.filter_basis import get_filter_basis
 from torch_harmonics.grid import GridS2, require_grid
+from torch_harmonics.neighborhood import precompute_neighborhood_arcs_s2, precompute_neighborhood_csr_s2
 from torch_harmonics.truncation import truncate_support
 
 
@@ -342,16 +354,39 @@ class NeighborhoodAttentionS2(nn.Module):
 
         self.grid_in = require_grid(grid_in, "grid_in")
         self.grid_out = require_grid(grid_out, "grid_out")
-        self.nlat_in, self.nlon_in = self.grid_in.shape
-        self.nlat_out, self.nlon_out = self.grid_out.shape
 
-        # direction selection: gather (self / downsample) iff nlon_in is an integer
-        # multiple of nlon_out; scatter (upsample) iff nlon_out is an integer multiple
-        # of nlon_in. Self-attention (nlon_in == nlon_out) satisfies both and falls
-        # through the gather path with pscale == 1.
-        self.upsample = (self.nlon_out % self.nlon_in == 0) and (self.nlon_in % self.nlon_out != 0)
-        if not (self.nlon_in % self.nlon_out == 0 or self.upsample):
-            raise ValueError(f"either nlon_in ({self.nlon_in}) must be an integer multiple of nlon_out ({self.nlon_out}), or vice versa, for the attention p-shift to be exact")
+        # A ragged grid has no (nlat, nlon) to unpack and no p-shift to be exact, so
+        # the two are separate paths rather than one path with a flag; see
+        # _setup_ragged below and the module docstring of
+        # attention.kernels_torch.attention_ragged_torch.
+        self.ragged = not (self.grid_in.is_regular and self.grid_out.is_regular)
+
+        if self.ragged:
+            if self.grid_in.is_regular != self.grid_out.is_regular:
+                raise ValueError(
+                    f"grid_in and grid_out must both be regular or both be ragged, got {self.grid_in!r} and {self.grid_out!r}. "
+                    "Mixing the two would need the neighbourhood keyed by output point on one side and by output latitude on the "
+                    "other; resample onto a common grid family first."
+                )
+            self.npoints_in = self.grid_in.npoints
+            self.npoints_out = self.grid_out.npoints
+
+            # The ragged path has one kernel for both directions -- its neighbour list
+            # is keyed by output point whichever way the resampling goes -- so unlike
+            # the regular path this flag selects nothing but the support radius below,
+            # for which the rule is the same: the coarser grid sets it.
+            self.upsample = self.npoints_out > self.npoints_in
+        else:
+            self.nlat_in, self.nlon_in = self.grid_in.shape
+            self.nlat_out, self.nlon_out = self.grid_out.shape
+
+            # direction selection: gather (self / downsample) iff nlon_in is an integer
+            # multiple of nlon_out; scatter (upsample) iff nlon_out is an integer multiple
+            # of nlon_in. Self-attention (nlon_in == nlon_out) satisfies both and falls
+            # through the gather path with pscale == 1.
+            self.upsample = (self.nlon_out % self.nlon_in == 0) and (self.nlon_in % self.nlon_out != 0)
+            if not (self.nlon_in % self.nlon_out == 0 or self.upsample):
+                raise ValueError(f"either nlon_in ({self.nlon_in}) must be an integer multiple of nlon_out ({self.nlon_out}), or vice versa, for the attention p-shift to be exact")
 
         self.in_channels = in_channels
         self.num_heads = num_heads
@@ -366,6 +401,102 @@ class NeighborhoodAttentionS2(nn.Module):
         # the output otherwise
         self.theta_cutoff = truncate_support(self.grid_in if self.upsample else self.grid_out, theta_cutoff)
 
+        if self.ragged:
+            self._setup_ragged()
+        else:
+            self._setup_regular()
+
+        # learnable parameters — Xavier uniform init matching PyTorch MHA convention:
+        # bound = sqrt(6 / (fan_in + fan_out)) for each projection
+        if self.k_channels % self.num_heads != 0:
+            raise ValueError(f"Please make sure that number of heads {self.num_heads} divides k_channels {self.k_channels} evenly.")
+        if self.out_channels % self.num_heads != 0:
+            raise ValueError(f"Please make sure that number of heads {self.num_heads} divides out_channels {self.out_channels} evenly.")
+        scale_qk = math.sqrt(6.0 / (self.in_channels + self.k_channels))
+        scale_v = math.sqrt(6.0 / (self.in_channels + self.out_channels))
+        scale_proj = math.sqrt(3.0 / self.out_channels)
+        self.q_weights = nn.Parameter(scale_qk * (2 * torch.rand(self.k_channels, self.in_channels, 1, 1) - 1))
+        self.k_weights = nn.Parameter(scale_qk * (2 * torch.rand(self.k_channels, self.in_channels, 1, 1) - 1))
+        self.v_weights = nn.Parameter(scale_v * (2 * torch.rand(self.out_channels, self.in_channels, 1, 1) - 1))
+        self.proj_weights = nn.Parameter(scale_proj * (2 * torch.rand(self.out_channels, self.out_channels, 1, 1) - 1))
+
+        if scale is not None:
+            self.scale = scale
+        else:
+            self.scale = 1 / math.sqrt(self.k_channels // self.num_heads)
+
+        if bias:
+            self.q_bias = nn.Parameter(torch.zeros(self.k_channels))
+            self.k_bias = nn.Parameter(torch.zeros(self.k_channels))
+            self.v_bias = nn.Parameter(torch.zeros(self.out_channels))
+            self.proj_bias = nn.Parameter(torch.zeros(self.out_channels))
+        else:
+            self.q_bias = None
+            self.k_bias = None
+            self.v_bias = None
+            self.proj_bias = None
+
+        if use_qknorm:
+            self.q_norm_weights = nn.Parameter(torch.zeros(self.k_channels // self.num_heads))
+            self.k_norm_weights = nn.Parameter(torch.zeros(self.k_channels // self.num_heads))
+        else:
+            self.q_norm_weights = None
+            self.k_norm_weights = None
+
+    def _setup_ragged(self):
+        r"""
+        Precompute for a ragged grid: a per-point quadrature weight and a neighbourhood
+        keyed by output point.
+
+        Both differ in kind from the regular case rather than in value. The weights are
+        per *point* because a ragged grid's rings differ in length, so
+        :math:`2\pi w_k / n_k` is not a single number times a per-latitude array; and
+        the neighbour list is per output point because no rotation carries one output
+        point's neighbourhood onto the next one's.
+
+        The pattern comes from :func:`~torch_harmonics.neighborhood.precompute_neighborhood_arcs_s2`,
+        which solves for it analytically, rather than from the DISCO precompute, which
+        evaluates a filter basis at rotated points and assumes the product structure.
+        """
+        weights_per_ring = 2.0 * torch.pi * self.grid_in.quad_weights / self.grid_in.nlon_per_lat
+        point_weights = torch.repeat_interleave(weights_per_ring, self.grid_in.nlon_per_lat).to(dtype=torch.float32)
+        self.register_buffer("point_weights", point_weights, persistent=False)
+
+        # Both forms of the same weights. The torch reference gathers per neighbour
+        # column, so it wants one weight per point; the arc kernels hoist the weight
+        # per arc, which is legitimate because it is constant along a ring, so they
+        # want one per ring. Keeping both costs nlat_in floats and saves the kernel a
+        # gather it does not need.
+        self.register_buffer("ring_weights", weights_per_ring.to(dtype=torch.float32), persistent=False)
+
+        arcs = precompute_neighborhood_arcs_s2(self.grid_in, self.grid_out, self.theta_cutoff)
+
+        # The arc form is what the CUDA kernels want; the torch reference walks a plain
+        # column list, which is what keeps it independent of the arc derivation. Take it
+        # from the cache so a stack of blocks on one grid expands the pattern once.
+        col_idx, row_off = precompute_neighborhood_csr_s2(self.grid_in, self.grid_out, self.theta_cutoff)
+        self.register_buffer("psi_col_idx", col_idx, persistent=False)
+        self.register_buffer("psi_roff_idx", row_off, persistent=False)
+        self.register_buffer("psi_seg", arcs.segments, persistent=False)
+        self.register_buffer("psi_seg_off", arcs.offsets, persistent=False)
+        self.register_buffer("psi_ring_base", arcs.ring_base, persistent=False)
+        self.register_buffer("psi_ring_size", arcs.ring_size, persistent=False)
+
+        # Two handles, chosen per call rather than once here, because the ragged
+        # kernels are CUDA-only: unlike the product-grid ops there is no CPU
+        # implementation to fall back on, so binding the optimized handle at setup
+        # would make a CPU module raise "Could not run ... with arguments from the
+        # 'CPU' backend" on its first forward. Device is not known at setup either --
+        # a module is routinely built on CPU and moved with .to() afterwards.
+        #
+        # `is None` means the extension predates the ops; keep the reference rather
+        # than fail, since a stale build must still serve this path.
+        self.optimized_kernel = self.optimized_kernel and _neighborhood_s2_attention_ragged_optimized is not None
+        self.attention_handle = _neighborhood_s2_attention_ragged_torch
+        self.attention_handle_optimized = _neighborhood_s2_attention_ragged_optimized
+
+    def _setup_regular(self):
+        """Precompute for a latitude/longitude product grid. The original path."""
         # integration weights live on the input grid
         wgl = self.grid_in.quad_weights
         quad_weights = 2.0 * torch.pi * wgl.to(dtype=torch.float32) / self.nlon_in
@@ -424,43 +555,6 @@ class NeighborhoodAttentionS2(nn.Module):
         self.register_buffer("psi_seg", psi_seg, persistent=False)
         self.register_buffer("psi_seg_off", psi_seg_off, persistent=False)
 
-        # learnable parameters — Xavier uniform init matching PyTorch MHA convention:
-        # bound = sqrt(6 / (fan_in + fan_out)) for each projection
-        if self.k_channels % self.num_heads != 0:
-            raise ValueError(f"Please make sure that number of heads {self.num_heads} divides k_channels {self.k_channels} evenly.")
-        if self.out_channels % self.num_heads != 0:
-            raise ValueError(f"Please make sure that number of heads {self.num_heads} divides out_channels {self.out_channels} evenly.")
-        scale_qk = math.sqrt(6.0 / (self.in_channels + self.k_channels))
-        scale_v = math.sqrt(6.0 / (self.in_channels + self.out_channels))
-        scale_proj = math.sqrt(3.0 / self.out_channels)
-        self.q_weights = nn.Parameter(scale_qk * (2 * torch.rand(self.k_channels, self.in_channels, 1, 1) - 1))
-        self.k_weights = nn.Parameter(scale_qk * (2 * torch.rand(self.k_channels, self.in_channels, 1, 1) - 1))
-        self.v_weights = nn.Parameter(scale_v * (2 * torch.rand(self.out_channels, self.in_channels, 1, 1) - 1))
-        self.proj_weights = nn.Parameter(scale_proj * (2 * torch.rand(self.out_channels, self.out_channels, 1, 1) - 1))
-
-        if scale is not None:
-            self.scale = scale
-        else:
-            self.scale = 1 / math.sqrt(self.k_channels // self.num_heads)
-
-        if bias:
-            self.q_bias = nn.Parameter(torch.zeros(self.k_channels))
-            self.k_bias = nn.Parameter(torch.zeros(self.k_channels))
-            self.v_bias = nn.Parameter(torch.zeros(self.out_channels))
-            self.proj_bias = nn.Parameter(torch.zeros(self.out_channels))
-        else:
-            self.q_bias = None
-            self.k_bias = None
-            self.v_bias = None
-            self.proj_bias = None
-
-        if use_qknorm:
-            self.q_norm_weights = nn.Parameter(torch.zeros(self.k_channels // self.num_heads))
-            self.k_norm_weights = nn.Parameter(torch.zeros(self.k_channels // self.num_heads))
-        else:
-            self.q_norm_weights = None
-            self.k_norm_weights = None
-
         if self.optimized_kernel:
             self.attention_handle = _neighborhood_s2_attention_optimized
         else:
@@ -469,9 +563,59 @@ class NeighborhoodAttentionS2(nn.Module):
     def extra_repr(self):
         return f"grid_in={self.grid_in!r},\ngrid_out={self.grid_out!r},\nin_channels={self.in_channels}, out_channels={self.out_channels}, k_channels={self.k_channels}, theta_cutoff={self.theta_cutoff}"
 
+    def _to_channels_last(self, tensor: torch.Tensor) -> torch.Tensor:
+        """``(batch, channels, *spatial)`` to ``(batch, *spatial, channels)``."""
+        # to_nhwc is a tiled kernel for the two-axis case; a ragged field has a single
+        # spatial axis, for which a transpose is the whole of it
+        return tensor.transpose(1, 2).contiguous() if self.ragged else to_nhwc(tensor)
+
+    def _to_channels_first(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Inverse of :meth:`_to_channels_last`."""
+        return tensor.transpose(1, 2).contiguous() if self.ragged else to_nchw(tensor)
+
+    def _head_rms_norm(self, tensor: torch.Tensor, norm_weights: torch.Tensor) -> torch.Tensor:
+        """
+        Per-head RMS normalization of a channels-last signal.
+
+        Channels-last puts the channel axis innermost, so splitting it into
+        (heads, per-head channels) is a reshape of contiguous memory -- a view, not a
+        copy. The channels-first form of this needed a 5D permute in and another back
+        out. Leaving the leading dimensions packed makes it indifferent to how many
+        spatial axes there are, which is what lets the ragged and regular paths share it.
+        """
+        shape = tensor.shape
+        split = tensor.reshape(*shape[:-1], self.num_heads, -1)
+        normed = F.rms_norm(split, normalized_shape=norm_weights.shape, weight=1 + norm_weights)
+        return normed.reshape(shape)
+
+    def _check_inputs(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        """Shape and dtype contract of the three inputs, for whichever grid kind this is."""
+        # change this later to allow arbitrary number of batch dims
+        ndim = 3 if self.ragged else 4
+        for tensor, name in ((query, "query"), (key, "key"), (value, "value")):
+            _check_ndim(tensor, ndim, name)
+        _check_dtypes_match((query, key, value))
+
+        if self.ragged:
+            _check_extent(query, -1, self.npoints_out, "query points")
+            _check_extent(key, -1, self.npoints_in, "key points")
+            _check_extent(value, -1, self.npoints_in, "value points")
+        else:
+            _check_extent(query, -2, self.nlat_out, "query latitudes")
+            _check_extent(query, -1, self.nlon_out, "query longitudes")
+            _check_extent(key, -2, self.nlat_in, "key latitudes")
+            _check_extent(key, -1, self.nlon_in, "key longitudes")
+            _check_extent(value, -2, self.nlat_in, "value latitudes")
+            _check_extent(value, -1, self.nlon_in, "value longitudes")
+
     def forward(self, query: torch.Tensor, key: Optional[torch.Tensor] = None, value: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Apply neighborhood attention on the sphere.
+
+        On a ragged grid such as HEALPix the two spatial axes collapse to one, so
+        every signal below is ``(batch, channels, npoints)`` in the flat order of its
+        grid -- RING order for :class:`~torch_harmonics.HealpixGrid` -- in place of
+        ``(batch, channels, nlat, nlon)``.
 
         Parameters
         ----------
@@ -497,26 +641,17 @@ class NeighborhoodAttentionS2(nn.Module):
         if value is None:
             value = query
 
-        # change this later to allow arbitrary number of batch dims
-        _check_ndim(query, 4, "query")
-        _check_ndim(key, 4, "key")
-        _check_ndim(value, 4, "value")
-        _check_dtypes_match((query, key, value))
-        _check_extent(query, -2, self.nlat_out, "query latitudes")
-        _check_extent(query, -1, self.nlon_out, "query longitudes")
-        _check_extent(key, -2, self.nlat_in, "key latitudes")
-        _check_extent(key, -1, self.nlon_in, "key longitudes")
-        _check_extent(value, -2, self.nlat_in, "value latitudes")
-        _check_extent(value, -1, self.nlon_in, "value longitudes")
+        self._check_inputs(query, key, value)
 
-        # Convert to NHWC once, here, and stay in it for the whole module. Every
-        # projection is 1x1 (see __init__), so in NHWC it is a plain GEMM over a
-        # contiguous reduction dimension rather than a convolution; qk-norm's head
-        # split becomes a free view; and the attention op already takes NHWC with
-        # heads packed along the channel dimension. The only conversions left are
-        # the two the channels-first public API forces: inputs in, output out.
+        # Convert to channels-last once, here, and stay in it for the whole module.
+        # Every projection is 1x1 (see __init__), so channels-last makes it a plain
+        # GEMM over a contiguous reduction dimension rather than a convolution;
+        # qk-norm's head split becomes a free view; and the attention op already takes
+        # channels-last with heads packed along the channel dimension. The only
+        # conversions left are the two the channels-first public API forces: inputs
+        # in, output out.
         #
-        # The shape checks above index dims -2/-1 as (lat, lon), so they have to
+        # The shape checks above index the spatial dims positionally, so they have to
         # run before this point.
         #
         # Self-attention binds all three names to one tensor (see the `key is None`
@@ -531,14 +666,14 @@ class NeighborhoodAttentionS2(nn.Module):
         value_is_query = value is query
         value_is_key = value is key
 
-        query = to_nhwc(query)
-        key = query if key_is_query else to_nhwc(key)
+        query = self._to_channels_last(query)
+        key = query if key_is_query else self._to_channels_last(key)
         if value_is_query:
             value = query
         elif value_is_key:
             value = key
         else:
-            value = to_nhwc(value)
+            value = self._to_channels_last(value)
 
         # perform QKV projections. The stored weights keep their (C_out, C_in, 1, 1)
         # convolution shape so checkpoints stay loadable; the view to (C_out, C_in)
@@ -547,43 +682,64 @@ class NeighborhoodAttentionS2(nn.Module):
         key = F.linear(key, self.k_weights.reshape(self.k_weights.shape[0], -1), self.k_bias)
         value = F.linear(value, self.v_weights.reshape(self.v_weights.shape[0], -1), self.v_bias)
 
-        # perform QK normalization (must come before scale). In NHWC the channel
-        # axis is innermost, so splitting it into (heads, per-head channels) is a
-        # reshape of contiguous memory -- a view, not a copy. The channels-first
-        # form of this needed a 5D permute in and another back out.
+        # perform QK normalization (must come before scale)
         if self.q_norm_weights is not None:
-            B, H, W, C = query.shape
-            query = query.reshape(B, H, W, self.num_heads, -1)
-            query = F.rms_norm(query, normalized_shape=self.q_norm_weights.shape, weight=1 + self.q_norm_weights)
-            query = query.reshape(B, H, W, C)
+            query = self._head_rms_norm(query, self.q_norm_weights)
 
         if self.k_norm_weights is not None:
-            B, H, W, C = key.shape
-            key = key.reshape(B, H, W, self.num_heads, -1)
-            key = F.rms_norm(key, normalized_shape=self.k_norm_weights.shape, weight=1 + self.k_norm_weights)
-            key = key.reshape(B, H, W, C)
+            key = self._head_rms_norm(key, self.k_norm_weights)
 
         # scale after normalization
         query_scaled = query * self.scale
 
-        out = self.attention_handle(
-            key,
-            value,
-            query_scaled,
-            self.quad_weights,
-            self.psi_col_idx,
-            self.psi_roff_idx,
-            self.psi_seg,
-            self.psi_seg_off,
-            self.num_heads,
-            self.nlon_in,
-            self.nlat_out,
-            self.nlon_out,
-        )
+        if self.ragged:
+            # CUDA-only kernels, so the device decides -- see _setup_ragged.
+            if self.optimized_kernel and query_scaled.is_cuda:
+                # The arc kernels take the per-ring weight and the arc encoding; the
+                # torch reference below takes the per-point weight and the CSR column
+                # list. Both describe the same neighbourhood -- see _setup_ragged.
+                out = self.attention_handle_optimized(
+                    key,
+                    value,
+                    query_scaled,
+                    self.ring_weights,
+                    self.psi_seg,
+                    self.psi_seg_off,
+                    self.psi_ring_base,
+                    self.psi_ring_size,
+                    self.num_heads,
+                    self.npoints_out,
+                )
+            else:
+                out = self.attention_handle(
+                    key,
+                    value,
+                    query_scaled,
+                    self.point_weights,
+                    self.psi_col_idx,
+                    self.psi_roff_idx,
+                    self.num_heads,
+                    self.npoints_out,
+                )
+        else:
+            out = self.attention_handle(
+                key,
+                value,
+                query_scaled,
+                self.quad_weights,
+                self.psi_col_idx,
+                self.psi_roff_idx,
+                self.psi_seg,
+                self.psi_seg_off,
+                self.num_heads,
+                self.nlon_in,
+                self.nlat_out,
+                self.nlon_out,
+            )
 
-        # output projection stays in NHWC for the same reason as the input ones;
+        # output projection stays channels-last for the same reason as the input ones;
         # only then back to channels-first. The matching backward conversion is
         # generated by autograd and uses the same tiled kernel.
         out = F.linear(out, self.proj_weights.reshape(self.proj_weights.shape[0], -1), self.proj_bias)
 
-        return to_nchw(out)
+        return self._to_channels_first(out)

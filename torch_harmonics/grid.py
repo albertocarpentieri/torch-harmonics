@@ -29,17 +29,18 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, Optional, Tuple, Type, Union
+from dataclasses import dataclass, fields
+from typing import Any, ClassVar, Dict, Optional, Set, Tuple, Type, Union
 
 import torch
 
 from torch_harmonics.partition import compute_split_shapes
-from torch_harmonics.quadrature import compute_latitude_spacing, precompute_latitudes, precompute_longitudes
+from torch_harmonics.quadrature import precompute_latitudes, precompute_longitudes
 
 __all__ = [
     "GridS2",
     "GridShardS2",
+    "RegularGridS2",
     "EquiangularGrid",
     "LegendreGaussGrid",
     "LobattoGrid",
@@ -52,11 +53,15 @@ __all__ = [
 # populated by __init_subclass__; maps the historical grid string to its class
 _GRID_REGISTRY: Dict[str, Type["GridS2"]] = {}
 
+# intermediate bases declared with `abstract=True`; they carry shared behaviour but
+# describe no grid, so they neither register a grid_type nor allow instantiation
+_ABSTRACT_GRIDS: Set[Type["GridS2"]] = set()
+
 
 @dataclass(frozen=True, eq=False)
 class GridS2:
     r"""
-    Descriptor for a latitude--longitude grid on :math:`S^2`.
+    Descriptor for an isolatitude grid on :math:`S^2`.
 
     This is the abstract base; instantiate one of the concrete subclasses, or use
     :func:`as_grid` to coerce a legacy ``(grid_string, shape)`` pair.
@@ -65,39 +70,47 @@ class GridS2:
     historical grid string it corresponds to, e.g. ``"equiangular"``. That string
     is used for serialization and for the registry behind :func:`as_grid`.
 
-    Parameters
-    ----------
-    nlat : int
-        Number of latitudinal nodes. Must be at least 2.
-    nlon : int
-        Number of longitudinal nodes. Must be at least 1.
+    The base deliberately declares **no fields**. A grid's parameters are whatever
+    identifies it: a latitude/longitude product grid is fixed by ``(nlat, nlon)``,
+    which is what :class:`RegularGridS2` adds, whereas HEALPix is fixed by a single
+    ``nside`` and has ``npoints != nlat * nlon``. Pushing the resolution down to the
+    subclass is what lets a ragged grid be an additive change rather than a second
+    API break.
+
+    Concrete subclasses must provide :attr:`params`, :attr:`nlat`, :attr:`nlon`,
+    :attr:`lats`, :attr:`quad_weights` and :meth:`lons`; everything else here is
+    derived from those.
 
     Notes
     -----
     Three properties of this type are load-bearing rather than incidental.
 
     Identity is a canonical tuple of scalars, and :attr:`key` backs both hashing
-    and equality. Node and weight tensors are deliberately not fields: a descriptor
-    carrying tensors would fall back to identity hashing and silently defeat every
-    cache keyed on the grid.
+    and equality. It is derived from :attr:`params` rather than restated, so a
+    parameter cannot be added to a grid and forgotten in its key -- a descriptor
+    whose key omitted a distinguishing parameter would silently serve one grid's
+    cached psi to another. Node and weight tensors are deliberately not fields: a
+    descriptor carrying tensors would fall back to identity hashing and silently
+    defeat every cache keyed on the grid.
 
     :attr:`nlon_per_lat` and :attr:`lon_offsets` exist on the regular grids too,
     where they are trivial. Consumers that cannot handle a ragged grid should assert
-    :attr:`is_regular` rather than assume a uniform ``nlon`` stride, so that reduced
-    Gaussian grids become an additive change instead of a second API break.
+    :attr:`is_regular` rather than assume a uniform ``nlon`` stride, and should read
+    :attr:`spatial_shape` rather than :attr:`shape`, which is a product grid's
+    notion and raises on a ragged one.
 
-    Descriptors stop at the Python layer: compiled kernels keep taking plain ints,
-    and modules unpack the descriptor before calling into them.
+    Descriptors stop at the Python layer: compiled kernels keep taking plain ints
+    and index tensors, and modules unpack the descriptor before calling into them.
     """
-
-    nlat: int
-    nlon: int
 
     #: historical grid string; set by each concrete subclass
     grid_type: ClassVar[str]
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, abstract: Optional[bool] = False, **kwargs):
         super().__init_subclass__(**kwargs)
+        if abstract:
+            _ABSTRACT_GRIDS.add(cls)
+            return
         grid_type = getattr(cls, "grid_type", None)
         if grid_type is None:
             raise TypeError(f"{cls.__name__} must define a 'grid_type' class attribute")
@@ -106,18 +119,25 @@ class GridS2:
         _GRID_REGISTRY[grid_type] = cls
 
     def __post_init__(self):
-        if type(self) is GridS2:
-            raise TypeError("GridS2 is abstract; instantiate a concrete grid or use as_grid()")
-        if not isinstance(self.nlat, int) or isinstance(self.nlat, bool):
-            raise ValueError(f"nlat must be an int, got {type(self.nlat).__name__}")
-        if not isinstance(self.nlon, int) or isinstance(self.nlon, bool):
-            raise ValueError(f"nlon must be an int, got {type(self.nlon).__name__}")
-        if self.nlat < 2:
-            raise ValueError(f"nlat must be at least 2, got {self.nlat}")
-        if self.nlon < 1:
-            raise ValueError(f"nlon must be at least 1, got {self.nlon}")
+        if type(self) is GridS2 or type(self) in _ABSTRACT_GRIDS:
+            raise TypeError(f"{type(self).__name__} is abstract; instantiate a concrete grid or use as_grid()")
+        self._validate()
+
+    def _validate(self):
+        """Check this grid's own parameters. Called from ``__post_init__``."""
+        raise NotImplementedError(f"{type(self).__name__} does not define _validate")
 
     # -- identity ------------------------------------------------------------
+
+    @property
+    def params(self) -> Dict[str, Any]:
+        """
+        The constructor arguments that identify this grid, as plain scalars.
+
+        Single source of truth for :attr:`key`, :meth:`to_dict` and ``__repr__``,
+        so those three cannot drift apart as grids are added.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not define params")
 
     @property
     def key(self) -> Tuple[Any, ...]:
@@ -126,9 +146,11 @@ class GridS2:
 
         Contains only scalars. Everything that distinguishes two grids must appear
         here, and nothing that does not; this tuple backs both ``__hash__`` and
-        ``__eq__``, and therefore every cache keyed on a descriptor.
+        ``__eq__``, and therefore every cache keyed on a descriptor. Built from
+        :attr:`params` so that it stays exhaustive by construction.
         """
-        return (self.grid_type, self.nlat, self.nlon)
+        params = self.params
+        return (self.grid_type,) + tuple(params[name] for name in sorted(params))
 
     def __hash__(self) -> int:
         return hash(self.key)
@@ -139,12 +161,55 @@ class GridS2:
         return self.key == other.key
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(nlat={self.nlat}, nlon={self.nlon})"
+        args = ", ".join(f"{name}={value}" for name, value in self.params.items())
+        return f"{type(self).__name__}({args})"
+
+    # -- resolution ----------------------------------------------------------
+    #
+    # nlat and nlon are deliberately *not* declared here, as properties or otherwise,
+    # even though everything below reads them and every concrete grid has them.
+    #
+    # A subclass supplies them either as dataclass fields (RegularGridS2, where the
+    # resolution *is* the parameterization) or as derived properties (HealpixGrid,
+    # where both follow from nside). Those two are mutually exclusive with a stub on
+    # the base: a property is a data descriptor, so it wins over the instance
+    # dictionary, and the frozen dataclass __init__ -- which assigns through
+    # object.__setattr__, and that honours data descriptors -- would fail with
+    # "property 'nlat' has no setter". Worse, @dataclass reads class attributes to
+    # find field defaults, so the stub would also silently become the default value
+    # of the field that shadows it.
+    #
+    # nlat is the number of latitude rings. nlon is the number of longitudes on the
+    # *widest* ring: on a regular grid that is every ring, on a ragged one it is the
+    # bound a dense azimuthal representation must accommodate, and never a stride --
+    # see nlon_per_lat for the per-ring counts.
 
     @property
     def shape(self) -> Tuple[int, int]:
-        """Spatial shape ``(nlat, nlon)`` of a field sampled on this grid."""
-        return (self.nlat, self.nlon)
+        """
+        Spatial shape ``(nlat, nlon)`` of a field sampled on this grid.
+
+        Only meaningful on a regular grid, and raises otherwise: a ragged grid
+        stores its points flat, and returning ``(nlat, nlon)`` for it would name a
+        rectangle that is larger than the grid. Ragged-aware consumers read
+        :attr:`spatial_shape`.
+        """
+        raise TypeError(
+            f"{type(self).__name__} is ragged, so it has no (nlat, nlon) shape: it carries "
+            f"{self.npoints} points flat, not {self.nlat} * {self.nlon}. Use spatial_shape for the "
+            "storage shape, nlon_per_lat and lon_offsets for the ring structure, and check is_regular "
+            "before assuming a uniform nlon stride."
+        )
+
+    @property
+    def spatial_shape(self) -> Tuple[int, ...]:
+        """
+        Shape of the spatial dimensions of a field on this grid.
+
+        ``(nlat, nlon)`` on a regular grid and ``(npoints,)`` on a ragged one, so a
+        layer can allocate and validate without knowing which it has.
+        """
+        return (self.nlat, self.nlon) if self.is_regular else (self.npoints,)
 
     # -- geometry ------------------------------------------------------------
 
@@ -153,8 +218,7 @@ class GridS2:
         r"""
         Colatitudes :math:`\theta_k \in [0, \pi]`, ascending (north pole first), shape ``(nlat,)``.
         """
-        lats, _ = precompute_latitudes(self.nlat, grid=self.grid_type)
-        return lats
+        raise NotImplementedError(f"{type(self).__name__} does not define lats")
 
     @property
     def quad_weights(self) -> torch.Tensor:
@@ -162,10 +226,10 @@ class GridS2:
         Latitudinal quadrature weights, shape ``(nlat,)``, paired with :attr:`lats`.
 
         Formulated in the :math:`\cos\theta` domain, so they already absorb the
-        :math:`\sin\theta` Jacobian and sum to 2.
+        :math:`\sin\theta` Jacobian and sum to 2. The weight of a single point on
+        ring ``k`` is ``2 * pi * quad_weights[k] / nlon_per_lat[k]``.
         """
-        _, w = precompute_latitudes(self.nlat, grid=self.grid_type)
-        return w
+        raise NotImplementedError(f"{type(self).__name__} does not define quad_weights")
 
     def lons(self, ilat: Optional[int] = None) -> torch.Tensor:
         r"""
@@ -175,15 +239,15 @@ class GridS2:
         ----------
         ilat : int, optional
             Index of the latitude ring. Ignored on regular grids, where every ring
-            carries the same longitudes; accepted so that consumers can be written
-            once and keep working on ragged grids.
+            carries the same longitudes; required on ragged ones, where both the
+            count and the offset of the ring's longitudes depend on it.
 
         Returns
         -------
         torch.Tensor
             Longitudes in radians, shape ``(nlon_per_lat[ilat],)``.
         """
-        return precompute_longitudes(self.nlon)
+        raise NotImplementedError(f"{type(self).__name__} does not define lons")
 
     # -- raggedness ----------------------------------------------------------
 
@@ -192,8 +256,9 @@ class GridS2:
         """
         Whether every latitude ring carries the same number of longitudes.
 
-        ``True`` for all currently implemented grids. Consumers backed by compiled
-        kernels, which index with a uniform ``nlon`` stride, should assert this.
+        ``True`` for the latitude/longitude product grids, ``False`` for HEALPix.
+        Consumers backed by compiled kernels that index with a uniform ``nlon``
+        stride should assert this.
         """
         return True
 
@@ -216,7 +281,7 @@ class GridS2:
     @property
     def npoints(self) -> int:
         """Total number of grid points."""
-        return self.nlat * self.nlon
+        return int(self.lon_offsets[-1].item())
 
     # -- derived quantities --------------------------------------------------
 
@@ -234,8 +299,28 @@ class GridS2:
         This is the grid's own notion of "one latitudinal grid spacing". Only
         :class:`EquiangularGrid` is uniform in :math:`\theta`, where it reduces to
         :math:`\pi / (N_\theta - 1)`.
+
+        Taken from the node distribution rather than from a per-grid formula, which
+        is what :func:`torch_harmonics.quadrature.compute_latitude_spacing` does for
+        the quadrature grids; the two agree by construction.
         """
-        return compute_latitude_spacing(self.nlat, grid=self.grid_type)
+        return self.latitude_spacing.max().item()
+
+    @property
+    def max_longitude_spacing(self) -> float:
+        r"""
+        Largest great-circle gap between neighbouring points *within* a latitude ring,
+        :math:`\max_k \frac{2\pi}{N_{\lambda,k}} \sin\theta_k`.
+
+        The azimuthal counterpart of :attr:`max_latitude_spacing`. On a product grid
+        with :math:`N_\lambda \approx 2 N_\theta` the two are within a few percent of
+        each other, which is why the localized operators have been able to describe
+        their support with the latitudinal one alone. A grid can be strongly
+        anisotropic though -- on HEALPix this is about 1.8x the latitudinal spacing --
+        and there the distinction decides whether an output point's stencil reaches
+        its neighbours at all.
+        """
+        return ((2.0 * torch.pi / self.nlon_per_lat.to(torch.float64)) * torch.sin(self.lats)).max().item()
 
     @property
     def is_uniform_in_theta(self) -> bool:
@@ -345,19 +430,43 @@ class GridS2:
         """Longitude counts held by each rank of a ``num_chunks``-way azimuthal split."""
         return tuple(compute_split_shapes(self.nlon, num_chunks))
 
-    # -- serialization -------------------------------------------------------
+    # -- construction and serialization --------------------------------------
+
+    @classmethod
+    def from_shape(cls, shape: Tuple[int, ...]) -> "GridS2":
+        """
+        Build this grid from a spatial shape, as :func:`as_grid` does.
+
+        The hook that lets ``as_grid`` stay one function across grid families whose
+        parameters differ: a product grid reads ``(nlat, nlon)`` off the shape, while
+        HEALPix recovers its ``nside`` from a point count.
+        """
+        raise NotImplementedError(f"{cls.__name__} does not define from_shape")
 
     def to_dict(self) -> Dict[str, Any]:
         """Plain-data representation, suitable for a config file or a checkpoint."""
-        return {"grid": self.grid_type, "nlat": self.nlat, "nlon": self.nlon}
+        return {"grid": self.grid_type, **self.params}
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "GridS2":
         """Inverse of :meth:`to_dict`."""
-        missing = {"grid", "nlat", "nlon"} - set(data)
+        if "grid" not in data:
+            raise ValueError("grid dict is missing ['grid']")
+        grid_type = data["grid"]
+        if grid_type not in _GRID_REGISTRY:
+            raise ValueError(f"Unknown grid type {grid_type}, expected one of {list(_GRID_REGISTRY)}")
+
+        cls = _GRID_REGISTRY[grid_type]
+        expected = {field.name for field in fields(cls)}
+        provided = set(data) - {"grid"}
+        missing = expected - provided
         if missing:
             raise ValueError(f"grid dict is missing {sorted(missing)}")
-        return as_grid(data["grid"], (data["nlat"], data["nlon"]))
+        unexpected = provided - expected
+        if unexpected:
+            raise ValueError(f"grid dict for '{grid_type}' has unexpected keys {sorted(unexpected)}, expected {sorted(expected)}")
+
+        return cls(**{name: data[name] for name in expected})
 
 
 @dataclass(frozen=True, eq=False)
@@ -524,7 +633,80 @@ class GridShardS2:
 
 
 @dataclass(frozen=True, eq=False)
-class EquiangularGrid(GridS2):
+class RegularGridS2(GridS2, abstract=True):
+    r"""
+    A latitude/longitude product grid: ``nlon`` equispaced longitudes on each of
+    ``nlat`` latitude rings.
+
+    Abstract in itself -- the latitude nodes and weights come from a quadrature rule,
+    which is what the concrete subclasses select via their ``grid_type`` -- but it
+    holds everything that follows from the product structure: a rectangular
+    ``(nlat, nlon)`` storage shape, a uniform ``2 * pi / nlon`` longitude spacing on
+    every ring, and a decomposition that is the product of a latitude range and a
+    longitude range.
+
+    Parameters
+    ----------
+    nlat : int
+        Number of latitudinal nodes. Must be at least 2.
+    nlon : int
+        Number of longitudinal nodes. Must be at least 1.
+    """
+
+    nlat: int
+    nlon: int
+
+    def _validate(self):
+        if not isinstance(self.nlat, int) or isinstance(self.nlat, bool):
+            raise ValueError(f"nlat must be an int, got {type(self.nlat).__name__}")
+        if not isinstance(self.nlon, int) or isinstance(self.nlon, bool):
+            raise ValueError(f"nlon must be an int, got {type(self.nlon).__name__}")
+        if self.nlat < 2:
+            raise ValueError(f"nlat must be at least 2, got {self.nlat}")
+        if self.nlon < 1:
+            raise ValueError(f"nlon must be at least 1, got {self.nlon}")
+
+    @property
+    def params(self) -> Dict[str, Any]:
+        return {"nlat": self.nlat, "nlon": self.nlon}
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        """Spatial shape ``(nlat, nlon)`` of a field sampled on this grid."""
+        return (self.nlat, self.nlon)
+
+    @property
+    def npoints(self) -> int:
+        """Total number of grid points."""
+        return self.nlat * self.nlon
+
+    # -- geometry ------------------------------------------------------------
+
+    @property
+    def lats(self) -> torch.Tensor:
+        lats, _ = precompute_latitudes(self.nlat, grid=self.grid_type)
+        return lats
+
+    @property
+    def quad_weights(self) -> torch.Tensor:
+        _, w = precompute_latitudes(self.nlat, grid=self.grid_type)
+        return w
+
+    def lons(self, ilat: Optional[int] = None) -> torch.Tensor:
+        return precompute_longitudes(self.nlon)
+
+    # -- construction --------------------------------------------------------
+
+    @classmethod
+    def from_shape(cls, shape: Tuple[int, ...]) -> "RegularGridS2":
+        if len(shape) != 2:
+            raise ValueError(f"shape must be a 2-tuple (nlat, nlon) for grid '{cls.grid_type}', got length {len(shape)}")
+        nlat, nlon = shape
+        return cls(nlat=int(nlat), nlon=int(nlon))
+
+
+@dataclass(frozen=True, eq=False)
+class EquiangularGrid(RegularGridS2):
     r"""
     Equiangular grid with Clenshaw--Curtis quadrature.
 
@@ -546,7 +728,7 @@ class EquiangularGrid(GridS2):
 
 
 @dataclass(frozen=True, eq=False)
-class LegendreGaussGrid(GridS2):
+class LegendreGaussGrid(RegularGridS2):
     r"""
     Gauss--Legendre grid; nodes are the roots of :math:`P_N(\cos\theta)`.
 
@@ -564,7 +746,7 @@ class LegendreGaussGrid(GridS2):
 
 
 @dataclass(frozen=True, eq=False)
-class LobattoGrid(GridS2):
+class LobattoGrid(RegularGridS2):
     r"""
     Gauss--Lobatto grid; nodes are the roots of :math:`P'_{N-1}(\cos\theta)` plus both poles.
 
@@ -581,7 +763,7 @@ class LobattoGrid(GridS2):
 
 
 @dataclass(frozen=True, eq=False)
-class EquiangularTrapezoidalGrid(GridS2):
+class EquiangularTrapezoidalGrid(RegularGridS2):
     r"""
     Trapezoidal rule applied on the :math:`\cos\theta` interval :math:`[-1, 1]`.
 
@@ -675,9 +857,33 @@ def require_grid(grid: Any, name: Optional[str] = "grid") -> GridS2:
     raise TypeError(f"{name} must be a GridS2, got {type(grid).__name__}. Build one with as_grid(<grid name>, (nlat, nlon)).")
 
 
-def grid_types() -> Tuple[str, ...]:
-    """Names of all registered grid types, in registration order."""
-    return tuple(_GRID_REGISTRY)
+def grid_types(regular: Optional[bool] = None) -> Tuple[str, ...]:
+    """
+    Names of the registered grid types, in registration order.
+
+    Parameters
+    ----------
+    regular : bool, optional
+        If given, keep only the grids whose points do (``True``) or do not
+        (``False``) form a latitude/longitude product. Callers that build a grid
+        from a ``(nlat, nlon)`` shape, or that index with a uniform ``nlon`` stride,
+        want ``regular=True``; by default every registered type is returned.
+
+    Returns
+    -------
+    tuple of str
+        The matching grid type names.
+
+    Examples
+    --------
+    >>> from torch_harmonics import grid_types
+    >>> grid_types(regular=True)
+    ('equiangular', 'legendre-gauss', 'lobatto', 'equiangular-trapezoidal')
+    """
+    names = tuple(_GRID_REGISTRY)
+    if regular is None:
+        return names
+    return tuple(name for name in names if issubclass(_GRID_REGISTRY[name], RegularGridS2) == regular)
 
 
 def as_grid(spec: Union[GridS2, str], shape: Optional[Tuple[int, int]] = None) -> GridS2:
@@ -693,8 +899,9 @@ def as_grid(spec: Union[GridS2, str], shape: Optional[Tuple[int, int]] = None) -
     spec : GridS2 or str
         A descriptor, which is returned unchanged, or a grid type name.
     shape : tuple of int, optional
-        ``(nlat, nlon)``. Required when ``spec`` is a string, and must agree with
-        the descriptor when one is passed.
+        The spatial shape the named grid should have: ``(nlat, nlon)`` for a product
+        grid and ``(npoints,)`` for a ragged one. Required when ``spec`` is a string,
+        and must agree with the descriptor when one is passed.
 
     Returns
     -------
@@ -704,8 +911,9 @@ def as_grid(spec: Union[GridS2, str], shape: Optional[Tuple[int, int]] = None) -
     Raises
     ------
     ValueError
-        If the grid type is unknown, if ``shape`` is missing for a string spec, or
-        if ``shape`` contradicts a descriptor spec.
+        If the grid type is unknown, if ``shape`` is missing for a string spec, if it
+        does not describe a valid resolution for that grid, or if it contradicts a
+        descriptor spec.
 
     Examples
     --------
@@ -714,7 +922,7 @@ def as_grid(spec: Union[GridS2, str], shape: Optional[Tuple[int, int]] = None) -
     EquiangularGrid(nlat=128, nlon=256)
     """
     if isinstance(spec, GridS2):
-        if shape is not None and tuple(shape) != spec.shape:
+        if shape is not None and tuple(shape) != spec.spatial_shape:
             raise ValueError(f"shape {tuple(shape)} contradicts the grid descriptor {spec}")
         return spec
 
@@ -726,8 +934,7 @@ def as_grid(spec: Union[GridS2, str], shape: Optional[Tuple[int, int]] = None) -
 
     if shape is None:
         raise ValueError(f"shape is required when specifying a grid by name (got grid='{spec}')")
-    if len(shape) != 2:
-        raise ValueError(f"shape must be a 2-tuple (nlat, nlon), got length {len(shape)}")
 
-    nlat, nlon = shape
-    return _GRID_REGISTRY[spec](nlat=int(nlat), nlon=int(nlon))
+    # each family reads its own parameters off the shape, since a ragged grid has no
+    # (nlat, nlon) to unpack
+    return _GRID_REGISTRY[spec].from_shape(tuple(shape))

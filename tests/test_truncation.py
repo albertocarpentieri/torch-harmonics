@@ -50,6 +50,7 @@ from parameterized import parameterized
 
 import torch_harmonics as th
 from torch_harmonics.grid import as_grid
+from torch_harmonics.healpix import HealpixGrid
 from torch_harmonics.truncation import truncate_sht, truncate_support
 
 # grid type -> expected max_exact_degree as a function of nlat, per the table in
@@ -208,17 +209,17 @@ class TestTruncateSupport(unittest.TestCase):
     # this class exercises the changed default on purpose
     warnings.filterwarnings("ignore", message="Default theta_cutoff changed", category=UserWarning)
 
-    @parameterized.expand([(g, n) for g in th.grid_types() for n in (16, 33, 64)])
+    @parameterized.expand([(g, n) for g in th.grid_types(regular=True) for n in (16, 33, 64)])
     def test_default_is_one_grid_spacing(self, grid, nlat):
         g = as_grid(grid, (nlat, 2 * nlat))
         self.assertEqual(truncate_support(g), g.max_latitude_spacing)
 
-    @parameterized.expand([(g,) for g in th.grid_types()])
+    @parameterized.expand([(g,) for g in th.grid_types(regular=True)])
     def test_default_matches_the_descriptor_property(self, grid):
         g = as_grid(grid, (32, 64))
         self.assertEqual(truncate_support(g), g.theta_cutoff())
 
-    @parameterized.expand([(g,) for g in th.grid_types()])
+    @parameterized.expand([(g,) for g in th.grid_types(regular=True)])
     def test_scale_multiplies_the_default(self, grid):
         g = as_grid(grid, (32, 64))
         self.assertAlmostEqual(truncate_support(g, scale=2.5), 2.5 * truncate_support(g), places=15)
@@ -238,7 +239,7 @@ class TestTruncateSupport(unittest.TestCase):
         with self.assertRaises(ValueError):
             truncate_support(g, theta_cutoff=bad)
 
-    @parameterized.expand([(g, s) for g in th.grid_types() for s in (0.0, -1.0)])
+    @parameterized.expand([(g, s) for g in th.grid_types(regular=True) for s in (0.0, -1.0)])
     def test_non_positive_scale_is_rejected(self, grid, bad):
         """The guard is on the radius returned, not on the argument it came from."""
         g = as_grid(grid, (32, 64))
@@ -278,18 +279,92 @@ class TestTruncateSupport(unittest.TestCase):
             truncate_support(as_grid("equiangular", (32, 64)))
 
 
+class TestTruncationOnHealpix(unittest.TestCase):
+    """
+    A ragged grid goes through the same policy functions as any other.
+
+    ``truncate_support`` had to stop re-deriving the node spacing from the grid
+    *string* for this to work: ``compute_theta_cutoff`` is keyed on ``(nlat, grid
+    name)`` and has nothing to say about a pixelization. Taking the spacing off the
+    descriptor lets HEALPix supply its own, which it must, because the latitudinal
+    spacing alone would collapse every stencil to a point.
+    """
+
+    # this class exercises the changed default on purpose
+    warnings.filterwarnings("ignore", message="Default theta_cutoff changed", category=UserWarning)
+
+    def test_the_support_radius_comes_from_the_descriptor(self):
+        g = HealpixGrid(nside=8)
+        self.assertEqual(truncate_support(g), g.theta_cutoff())
+        self.assertAlmostEqual(truncate_support(g, scale=2.5), 2.5 * truncate_support(g), places=15)
+
+    def test_the_support_radius_is_wider_than_the_latitudinal_spacing(self):
+        """The HEALPix override, seen through the policy function the layers call."""
+        g = HealpixGrid(nside=8)
+        self.assertGreater(truncate_support(g), g.max_latitude_spacing)
+        self.assertEqual(truncate_support(g), g.max_longitude_spacing)
+
+    def test_an_explicit_value_still_wins(self):
+        g = HealpixGrid(nside=8)
+        self.assertEqual(truncate_support(g, theta_cutoff=0.3), 0.3)
+        with self.assertRaises(ValueError):
+            truncate_support(g, theta_cutoff=-0.1)
+
+    def test_the_default_warns_because_the_nodes_are_not_uniform_in_theta(self):
+        with self.assertWarns(UserWarning):
+            truncate_support(HealpixGrid(nside=8))
+
+    def test_the_warning_quotes_the_radius_it_actually_returns(self):
+        """
+        Regression: the message used to quote ``max_latitude_spacing``, which on a grid
+        that overrides ``theta_cutoff`` is not the radius the caller gets. On HEALPix it
+        named a number roughly 1.8x smaller than the one in force, so a reader checking
+        whether the default suited them was checking the wrong figure.
+        """
+        g = HealpixGrid(nside=4)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", UserWarning)
+            radius = truncate_support(g)
+
+        messages = [str(w.message) for w in caught if "Default theta_cutoff changed" in str(w.message)]
+        self.assertEqual(len(messages), 1)
+        self.assertIn(f"{radius:.6g} rad", messages[0])
+        # and that is a different number from the one it used to quote
+        self.assertNotIn(f"{g.max_latitude_spacing:.6g} rad", messages[0])
+
+    def test_the_scale_is_reflected_in_the_warning(self):
+        """``scale`` multiplies the default, so the quoted radius has to follow it."""
+        g = HealpixGrid(nside=4)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", UserWarning)
+            radius = truncate_support(g, scale=0.5)
+
+        messages = [str(w.message) for w in caught if "Default theta_cutoff changed" in str(w.message)]
+        self.assertIn(f"{radius:.6g} rad", messages[0])
+
+    def test_a_transform_is_refused_rather_than_silently_wrong(self):
+        """
+        The equal-area rule integrates a constant and nothing else, so there is no
+        honest default truncation to hand back.
+        """
+        with self.assertRaises(NotImplementedError):
+            truncate_sht(HealpixGrid(nside=8))
+
+
 class TestLayersUseTruncateSupport(unittest.TestCase):
     """The layers must not reimplement the policy they delegate."""
 
     warnings.filterwarnings("ignore", message="Default theta_cutoff changed", category=UserWarning)
 
-    @parameterized.expand([(g,) for g in th.grid_types()])
+    @parameterized.expand([(g,) for g in th.grid_types(regular=True)])
     def test_conv_default_comes_from_the_output_grid(self, grid):
         gi, go = as_grid(grid, (32, 64)), as_grid(grid, (16, 32))
         conv = th.DiscreteContinuousConvS2(gi, go, 2, 2, kernel_shape=3)
         self.assertEqual(conv.theta_cutoff, truncate_support(go))
 
-    @parameterized.expand([(g,) for g in th.grid_types()])
+    @parameterized.expand([(g,) for g in th.grid_types(regular=True)])
     def test_transpose_conv_default_comes_from_the_input_grid(self, grid):
         gi, go = as_grid(grid, (16, 32)), as_grid(grid, (32, 64))
         conv = th.DiscreteContinuousConvTransposeS2(gi, go, 2, 2, kernel_shape=3)

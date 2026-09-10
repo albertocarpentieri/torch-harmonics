@@ -196,6 +196,8 @@ def get_ext_modules():
                 "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_utils.cu",
                 "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_fwd.cu",
                 "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_bwd.cu",
+                "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_fwd_ragged.cu",
+                "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_bwd_ragged.cu",
                 "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_fwd_upsample.cu",
                 "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_bwd_upsample.cu",
                 "torch_harmonics/attention/optimized/kernels_cuda/attention_cuda_fwd_ring.cu",

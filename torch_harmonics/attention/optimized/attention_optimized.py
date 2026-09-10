@@ -35,7 +35,26 @@ import torch
 from attention_helpers import optimized_kernels_is_available
 
 from .. import attention_kernels
-from .._attention_utils import _setup_context_attention_backward
+from .._attention_utils import _setup_context_attention_backward, _setup_context_attention_ragged_backward
+
+
+def _op_is_declared(name: str) -> bool:
+    """
+    Whether the compiled extension declares an operator of this name.
+
+    ``register_fake`` raises if the operator it names does not exist, so a fake
+    registered unconditionally turns a compiled extension that predates the
+    operator into an unimportable package -- and takes down every unrelated code
+    path with it, not just the one that would have used the kernel. That skew is
+    routine while an operator is being added: the Python sources are read from the
+    tree but the extension comes from whenever it was last built.
+    """
+    try:
+        getattr(torch.ops.attention_kernels, name)
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
 
 # define NA op for CUDA
 if optimized_kernels_is_available():
@@ -81,6 +100,53 @@ if optimized_kernels_is_available():
         dv = torch.empty_like(vw)
         dq = torch.empty_like(qw)
         return dk, dv, dq
+
+    # raw ragged forward fake. Gated once more, because the ragged kernels are newer
+    # than the product-grid ones: an extension built before them still serves every
+    # other path correctly, and must not be turned into an import error.
+    if _op_is_declared("forward_ragged"):
+
+        @torch.library.register_fake("attention_kernels::forward_ragged")
+        def _(
+            kw: torch.Tensor,
+            vw: torch.Tensor,
+            qw: torch.Tensor,
+            ring_weights: torch.Tensor,
+            seg: torch.Tensor,
+            seg_off: torch.Tensor,
+            ring_base: torch.Tensor,
+            ring_size: torch.Tensor,
+            num_heads: int,
+            npoints_out: int,
+        ) -> torch.Tensor:
+            # NHWC with the spatial axes flattened: (B, npoints_out, num_heads * C_v).
+            # The channel extent comes from vw, which already carries the packed width.
+            out_shape = (kw.shape[0], npoints_out, vw.shape[2])
+            return torch.empty(out_shape, dtype=kw.dtype, device=kw.device)
+
+    # raw ragged backward fake, gated for the same reason as the forward above.
+    if _op_is_declared("backward_ragged"):
+
+        @torch.library.register_fake("attention_kernels::backward_ragged")
+        def _(
+            kw: torch.Tensor,
+            vw: torch.Tensor,
+            qw: torch.Tensor,
+            dy: torch.Tensor,
+            ring_weights: torch.Tensor,
+            seg: torch.Tensor,
+            seg_off: torch.Tensor,
+            ring_base: torch.Tensor,
+            ring_size: torch.Tensor,
+            num_heads: int,
+            npoints_out: int,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            # Each gradient has the shape and dtype of the tensor it differentiates:
+            # the kernel accumulates in fp32 internally but narrows before returning.
+            dk = torch.empty_like(kw)
+            dv = torch.empty_like(vw)
+            dq = torch.empty_like(qw)
+            return dk, dv, dq
 
     # fake implementations for ring step ops
     @torch.library.register_fake("attention_kernels::forward_ring_step")
@@ -277,6 +343,74 @@ if optimized_kernels_is_available():
     ) -> torch.Tensor:
         out_shape = (kw.shape[0], nlat_out, nlon_out, vw.shape[3])
         return torch.empty(out_shape, dtype=kw.dtype, device=kw.device)
+
+    # Autograd-complete ragged op. Gated on BOTH halves being declared: a
+    # forward-only fast path is worse than no fast path, because it would be
+    # selected during setup and then fail on the first input that needs a
+    # gradient, i.e. in training rather than at import.
+    if _op_is_declared("forward_ragged") and _op_is_declared("backward_ragged"):
+
+        @torch.library.custom_op("attention_kernels::_neighborhood_s2_attention_ragged_optimized", mutates_args=())
+        def _neighborhood_s2_attention_ragged_optimized(
+            kw: torch.Tensor,
+            vw: torch.Tensor,
+            qw: torch.Tensor,
+            ring_weights: torch.Tensor,
+            seg: torch.Tensor,
+            seg_off: torch.Tensor,
+            ring_base: torch.Tensor,
+            ring_size: torch.Tensor,
+            nh: int,
+            npoints_out: int,
+        ) -> torch.Tensor:
+            # NHWC with the spatial axes flattened, heads packed along channels, in
+            # the grid's flat point order (RING for HEALPix). Native dtype is kept;
+            # the kernel widens at the load site.
+            kw = kw.contiguous()
+            vw = vw.contiguous()
+            qw = qw.contiguous()
+
+            return attention_kernels.forward_ragged.default(
+                kw, vw, qw, ring_weights, seg, seg_off, ring_base, ring_size, nh, npoints_out
+            )
+
+        @torch.library.register_fake("attention_kernels::_neighborhood_s2_attention_ragged_optimized")
+        def _(
+            kw: torch.Tensor,
+            vw: torch.Tensor,
+            qw: torch.Tensor,
+            ring_weights: torch.Tensor,
+            seg: torch.Tensor,
+            seg_off: torch.Tensor,
+            ring_base: torch.Tensor,
+            ring_size: torch.Tensor,
+            nh: int,
+            npoints_out: int,
+        ) -> torch.Tensor:
+            out_shape = (kw.shape[0], npoints_out, vw.shape[2])
+            return torch.empty(out_shape, dtype=kw.dtype, device=kw.device)
+
+        def _neighborhood_s2_attention_ragged_bwd_optimized(ctx, grad_output):
+            seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw = ctx.saved_tensors
+
+            kw = kw.contiguous()
+            vw = vw.contiguous()
+            qw = qw.contiguous()
+            grad_output = grad_output.contiguous()
+
+            dkw, dvw, dqw = attention_kernels.backward_ragged.default(
+                kw, vw, qw, grad_output, ring_weights, seg, seg_off, ring_base, ring_size, ctx.nh, ctx.npoints_out
+            )
+
+            # one gradient per forward input: kw, vw, qw, then None for
+            # ring_weights, seg, seg_off, ring_base, ring_size, nh, npoints_out
+            return dkw, dvw, dqw, None, None, None, None, None, None, None
+
+        torch.library.register_autograd(
+            "attention_kernels::_neighborhood_s2_attention_ragged_optimized",
+            _neighborhood_s2_attention_ragged_bwd_optimized,
+            setup_context=_setup_context_attention_ragged_backward,
+        )
 
 
 def _neighborhood_s2_attention_bwd_optimized(ctx, grad_output):

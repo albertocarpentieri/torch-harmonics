@@ -185,7 +185,7 @@ class TestGridDescriptorCaching(unittest.TestCase):
             calls.append(grid)
             return grid.nlat * grid.nlon
 
-        for grid_type in grid_types():
+        for grid_type in grid_types(regular=True):
             with self.subTest(grid=grid_type):
                 calls.clear()
                 first = _expensive(as_grid(grid_type, (64, 128)))
@@ -217,7 +217,7 @@ class TestGridDescriptorCaching(unittest.TestCase):
 
     def test_descriptor_survives_deepcopy(self):
         """``lru_cache(copy=True)`` deep-copies its return value, so a cached descriptor must remain a valid key."""
-        for grid_type in grid_types():
+        for grid_type in grid_types(regular=True):
             with self.subTest(grid=grid_type):
                 grid = as_grid(grid_type, (64, 128))
                 clone = deepcopy(grid)
@@ -234,7 +234,7 @@ class TestGridDescriptorCaching(unittest.TestCase):
         :meth:`TestCacheConsistency.test_consistency` guards the Legendre cache.
         """
         with torch.no_grad():
-            for grid_type in grid_types():
+            for grid_type in grid_types(regular=True):
                 with self.subTest(grid=grid_type):
                     grid = as_grid(grid_type, (32, 64))
                     pristine_lats, pristine_weights = grid.lats.clone(), grid.quad_weights.clone()
@@ -251,7 +251,7 @@ class TestGridDescriptorCaching(unittest.TestCase):
 
     def test_descriptor_returns_independent_tensors(self):
         """Two accesses must not alias, otherwise one consumer's in-place op leaks into another's."""
-        for grid_type in grid_types():
+        for grid_type in grid_types(regular=True):
             with self.subTest(grid=grid_type):
                 grid = as_grid(grid_type, (32, 64))
                 first, second = grid.lats, grid.lats
@@ -260,7 +260,7 @@ class TestGridDescriptorCaching(unittest.TestCase):
 
     def test_derived_scalars_are_consistent_across_accesses(self):
         """``max_latitude_spacing`` is itself cached; repeated access must be stable and match the nodes."""
-        for grid_type in grid_types():
+        for grid_type in grid_types(regular=True):
             with self.subTest(grid=grid_type):
                 grid = as_grid(grid_type, (65, 128))
                 first = grid.max_latitude_spacing

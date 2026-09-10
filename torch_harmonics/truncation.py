@@ -33,7 +33,6 @@ import warnings
 from typing import Optional, Tuple
 
 from torch_harmonics.grid import GridS2, require_grid
-from torch_harmonics.quadrature import compute_theta_cutoff
 
 
 def truncate_sht(grid: GridS2, lmax: Optional[int] = None, mmax: Optional[int] = None) -> Tuple[int, int]:
@@ -146,19 +145,25 @@ def truncate_support(grid: GridS2, theta_cutoff: Optional[float] = None, scale: 
     bound the grid can support, apply a user override if one is given, and warn
     when the default they pick differs from the one a previous release used.
 
-    The default is one latitudinal node spacing of the grid, so that the basis
-    functions of adjacent output points overlap and every output point sees more
-    than the single latitude ring it sits on. That spacing is a fact about the
-    node distribution, which the descriptor also reports as
-    :attr:`~torch_harmonics.grid.GridS2.max_latitude_spacing`; the policy of
-    turning it into a default, of rejecting a non-positive result, and of warning
-    that the default moved, lives here.
+    The default is one grid spacing, so that the basis functions of adjacent output
+    points overlap and every output point sees more than the single latitude ring it
+    sits on. What "one spacing" means is the grid's own business, and it answers via
+    :meth:`~torch_harmonics.grid.GridS2.theta_cutoff`: the product grids take the
+    latitudinal spacing (:attr:`~torch_harmonics.grid.GridS2.max_latitude_spacing`),
+    while :class:`~torch_harmonics.HealpixGrid` takes the larger of the latitudinal
+    and longitudinal spacings, being anisotropic enough that the latitudinal one alone
+    would not reach a pixel's own diagonal neighbours. The policy of turning that into
+    a default, of rejecting a non-positive result, and of warning that the default
+    moved, lives here.
 
-    The spacing comes via :func:`torch_harmonics.quadrature.compute_theta_cutoff`
-    rather than off the descriptor property, because the changed-default warning
-    is raised there. The two agree by construction -- both are
-    :func:`~torch_harmonics.quadrature.compute_latitude_spacing` of the same grid
-    -- and ``test_default_is_one_grid_spacing`` pins that they keep agreeing.
+    The spacing comes off the descriptor, which is the only source that generalizes:
+    :func:`torch_harmonics.quadrature.compute_theta_cutoff` is keyed on ``nlat`` plus
+    a grid *string*, so it can only answer for the four quadrature grids and has
+    nothing to say about a HEALPix grid, whose nodes come from a pixelization rather
+    than from a rule on :math:`\cos\theta`. The changed-default warning moved here
+    with it, which is where the policy belonged anyway;
+    ``test_default_is_one_grid_spacing`` pins that the two routes still agree on the
+    grids where both are defined.
 
     Parameters
     ----------
@@ -211,8 +216,22 @@ def truncate_support(grid: GridS2, theta_cutoff: Optional[float] = None, scale: 
     if theta_cutoff is None:
         # a support radius taken from a shard would differ between ranks
         grid = require_grid(grid)
-        radius = scale * compute_theta_cutoff(grid.nlat, grid=grid.grid_type)
+        radius = grid.theta_cutoff(scale=scale)
         origin = f"scale={scale} times the grid spacing"
+        if not grid.is_uniform_in_theta:
+            # Report the radius actually returned, not max_latitude_spacing. They differ
+            # whenever a grid overrides theta_cutoff, which HealpixGrid does: it takes the
+            # larger of the latitudinal and longitudinal spacings, because HEALPix is
+            # anisotropic enough that one latitudinal spacing would not reach a pixel's own
+            # diagonal neighbours. Quoting the latitudinal figure there named a number the
+            # caller would never see used.
+            warnings.warn(
+                f"Default theta_cutoff changed in v0.9.3: it is now one grid spacing as the grid descriptor "
+                f"reports it ({radius:.6g} rad for {grid!r}) rather than pi / (nlat - 1). The nodes of this "
+                "grid are not equispaced in theta, so the two differ. Pass theta_cutoff explicitly to override.",
+                UserWarning,
+                stacklevel=2,
+            )
     else:
         radius = theta_cutoff
         origin = f"theta_cutoff={theta_cutoff}"

@@ -124,6 +124,57 @@ namespace attention_kernels
               "(Tensor, Tensor, Tensor)",
               {at::Tag::pt2_compliant_tag});
 
+        // ---- Ragged (HEALPix) self-attention ----
+        // Same gather direction as `forward` above, on a grid whose rings hold
+        // differing numbers of points. The product-grid ops store one neighbour list
+        // per output latitude and slide it along the ring with the p-shift wip = wi +
+        // pscale*wo; that identity needs rotational self-similarity, which a ragged
+        // grid does not have. So here the pattern is keyed per output POINT, the
+        // p-shift is gone, and nlon_in / nlat_out / nlon_out collapse to a single
+        // npoints_out.
+        //
+        // LAYOUT: activations are physical NHWC with the two spatial axes flattened,
+        //   kx, vx : [B, npoints_in,  num_heads * C_k / C_v]
+        //   qy, y  : [B, npoints_out, num_heads * C_k / C_v]
+        // in the grid's flat point order, which for HEALPix is RING ordering -- that
+        // is what makes a ring contiguous and hence an arc stride-1.
+        //
+        // psi convention (see precompute_neighborhood_arcs_s2):
+        //   seg      : (nsegs, 3) int32 holding (input_ring, point_start, arc_len),
+        //              one arc per (output point, input ring) pair
+        //   seg_off  : int32, length npoints_out + 1, mapping an output point to its
+        //              segment range
+        //   ring_base: int64, length nlat_in, flat index of each input ring's first
+        //              point
+        //   ring_size: int64, length nlat_in, points on each input ring; an arc wraps
+        //              at ring_base + ring_size
+        // There is no col_idx here. On a product grid it is kept because the CPU and
+        // torch reference paths consume it, which is what keeps the reference
+        // independent of the arc derivation; the ragged reference consumes a CSR
+        // expansion built by NeighborhoodArcsS2.to_csr on the Python side instead, so
+        // the kernel ABI carries only the arcs.
+        //
+        // ring_weights is the per-ring quadrature weight (2*pi*w_ring / n_ring),
+        // constant along a ring and therefore hoisted per arc, exactly as
+        // quad_weights[hi] is on the product grids.
+        m.def("forward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor ring_weights, Tensor seg, Tensor seg_off, "
+              "Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> Tensor",
+              {at::Tag::pt2_compliant_tag});
+
+        // dy is inserted after qy, mirroring how `backward` extends `forward` on the
+        // product grids; the psi arguments and their conventions are unchanged from
+        // `forward_ragged` above. Returns (dkx, dvx, dqy).
+        //
+        // dkx/dvx are scatter-accumulated with atomicAdd into fp32 buffers and
+        // narrowed to the input dtype on return, as in `backward`. Raggedness does
+        // not change that: the accumulation is needed because neighbourhoods of
+        // distinct output points overlap, which is a property of the neighbourhood
+        // and not of the grid being a product grid.
+        m.def("backward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor dy, Tensor ring_weights, Tensor seg, "
+              "Tensor seg_off, Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> "
+              "(Tensor, Tensor, Tensor)",
+              {at::Tag::pt2_compliant_tag});
+
         // ---- Ring-step variants for DistributedNeighborhoodAttentionS2 ----
         // K/V are sharded along longitude across an azimuth process group; each
         // step processes one rotating chunk and accumulates state buffers for

@@ -104,6 +104,17 @@ def _setup_context_attention_backward(ctx, inputs, output):
     ctx.nlon_out = nlon_out
 
 
+def _setup_context_attention_ragged_backward(ctx, inputs, output):
+    # No col_idx / row_off here. On the product grids both are saved because the CPU
+    # backward consumes the column list; the ragged path has no CPU kernel, and its
+    # torch reference is a separate handle that never reaches this op, so the arcs
+    # are the only pattern the saved context needs to carry.
+    kw, vw, qw, ring_weights, seg, seg_off, ring_base, ring_size, nh, npoints_out = inputs
+    ctx.save_for_backward(seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw)
+    ctx.nh = nh
+    ctx.npoints_out = npoints_out
+
+
 def _build_psi_segments(col_idx: torch.Tensor, roff_idx: torch.Tensor, nlon: int):
     """
     Re-express psi's column list as contiguous longitude arcs.
