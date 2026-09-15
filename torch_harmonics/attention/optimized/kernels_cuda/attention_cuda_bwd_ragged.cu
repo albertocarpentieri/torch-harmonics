@@ -51,8 +51,8 @@
 //
 // Two passes over the same arcs
 // -----------------------------
-// Pass 1 accumulates the running-softmax statistics (alpha_sum, qdotk_max, and the
-// three shared reductions) and writes dqy. Pass 2 replays the arcs with the final
+// Pass 1 accumulates the running-softmax statistics (alpha_sum, qdotk_max, the two
+// per-channel reductions and the scalar alpha_vw_) and writes dqy. Pass 2 replays the arcs with the final
 // qdotk_max to scatter dk/dv. The replay is what avoids materialising the per-
 // neighbour alphas, which on a HEALPix neighbourhood would be a far larger array
 // than on a product grid, since the pattern here is npoints_out/nlat_out ~ 3*nside
@@ -115,10 +115,19 @@ namespace attention_kernels
 
         extern __shared__ __align__(sizeof(float4)) float shext[];
 
-        // five per-warp arrays: 4 * nchans_in + nchans_out
-        COMPUTE_T *sh_alpha_k__ = reinterpret_cast<COMPUTE_T *>(shext) + threadIdx.y * (nchans_in * 4 + nchans_out);
-        COMPUTE_T *sh_alpha_vw_ = sh_alpha_k__ + nchans_in;
-        COMPUTE_T *sh_alpha_kvw = sh_alpha_vw_ + nchans_in;
+        // Four per-warp arrays: 3 * nchans_in + nchans_out.
+        //
+        // The product-grid kernels carry a fifth, alpha_vw_, one entry per channel.
+        // Its recurrence is alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv and
+        // both of those are warp-uniform scalars, so every entry holds the same
+        // number and always has: it is a scalar accumulator stored nchans_in times.
+        // It is only ever consumed as a multiplier of sh_alpha_k__ when dqy is
+        // written, so a single register does the same work. Dropping it removes a
+        // third of pass 1's shared-memory read-modify-writes and a quarter of the
+        // per-warp footprint. (attention_cuda_bwd.cu replicates it in both its
+        // generic and its register-blocked kernel; the redundancy is not ragged's.)
+        COMPUTE_T *sh_alpha_k__ = reinterpret_cast<COMPUTE_T *>(shext) + threadIdx.y * (nchans_in * 3 + nchans_out);
+        COMPUTE_T *sh_alpha_kvw = sh_alpha_k__ + nchans_in;
 
         COMPUTE_T *sh_dy = sh_alpha_kvw + nchans_in;
         COMPUTE_T *sh_qy = sh_dy + nchans_out;
@@ -157,7 +166,6 @@ namespace attention_kernels
         // zero/init shared memory
         for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
             sh_alpha_k__[chan] = __vset<COMPUTE_T>(0.0f);
-            sh_alpha_vw_[chan] = __vset<COMPUTE_T>(0.0f);
             sh_alpha_kvw[chan] = __vset<COMPUTE_T>(0.0f);
 
             sh_qy[chan] = vload(qy, chan);
@@ -178,6 +186,9 @@ namespace attention_kernels
 
         // for dkx
         float integral = 0.0f;
+
+        // the scalar that replaces the replicated sh_alpha_vw_ array
+        float alpha_vw_ = 0.0f;
 
         const int seg_beg = seg_off[ipoint];
         const int seg_end = seg_off[ipoint + 1];
@@ -228,13 +239,14 @@ namespace attention_kernels
 
                 const float ainz_gdotv = alpha_inz * gdotv;
 
+                // same recurrence the per-channel array used to run, once
+                alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv;
+
                 for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
 
                     const COMPUTE_T kxval = vload(_kx, chan);
 
                     sh_alpha_k__[chan] = __vadd(__vscale(max_correction, sh_alpha_k__[chan]), __vscale(alpha_inz, kxval));
-                    sh_alpha_vw_[chan]
-                        = __vadd(__vscale(max_correction, sh_alpha_vw_[chan]), __vset<COMPUTE_T>(ainz_gdotv));
                     sh_alpha_kvw[chan]
                         = __vadd(__vscale(max_correction, sh_alpha_kvw[chan]), __vscale(ainz_gdotv, kxval));
                 }
@@ -252,9 +264,11 @@ namespace attention_kernels
         // Write dqy (fp32 output)
         for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
 
+            // __vscale by the scalar, where this used to __vmul by a vector every
+            // entry of which held that scalar
             dqy[chan] = __vscale(
                 alpha_sum_inv * alpha_sum_inv,
-                __vsub(__vscale(alpha_sum, sh_alpha_kvw[chan]), __vmul(sh_alpha_vw_[chan], sh_alpha_k__[chan])));
+                __vsub(__vscale(alpha_sum, sh_alpha_kvw[chan]), __vscale(alpha_vw_, sh_alpha_k__[chan])));
         }
 
         // Pass 2: replay the arcs with the final qdotk_max to scatter dk/dv.
@@ -352,8 +366,9 @@ namespace attention_kernels
         // one block row per (batch, head) pair
         dim3 grid(DIV_UP(npoints_out, block.y), batch_size * nheads);
 
-        // shared memory holds compute-type (COMPUTE_T) data, not STORAGE_T. 5 arrays per warp.
-        size_t shsize = sizeof(typename vec_traits<STORAGE_T>::compute_t) * (nchans_in * 4 + nchans_out) * block.y;
+        // shared memory holds compute-type (COMPUTE_T) data, not STORAGE_T. 4 arrays
+        // per warp; the fifth was alpha_vw_, which is a scalar (see the kernel).
+        size_t shsize = sizeof(typename vec_traits<STORAGE_T>::compute_t) * (nchans_in * 3 + nchans_out) * block.y;
 
         s2_attn_bwd_ragged_generic_vec_k<THREADS><<<grid, block, shsize, stream>>>(
             nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _seg, _seg_off, _ring_base,
@@ -413,6 +428,13 @@ namespace attention_kernels
                     qy.scalar_type(), ")");
         TORCH_CHECK(dy.scalar_type() == qy.scalar_type(), "dy dtype (", dy.scalar_type(), ") must match q dtype (",
                     qy.scalar_type(), ")");
+
+        // ring_weights is read as float32 whatever scalar_t the dispatch picks, so it
+        // is the one tensor that must not follow the activations. Casting a whole
+        // module to bf16 would sweep it along, and reinterpreting those bytes as float
+        // computes silent garbage instead of failing.
+        TORCH_CHECK(ring_weights.scalar_type() == at::kFloat, "ring_weights must be float32, got ",
+                    ring_weights.scalar_type());
 
         // per-head channel counts; the packed extent is num_heads times these
         const int nchans_in = qy.size(2) / num_heads; // or kx.size(2) / num_heads
