@@ -54,10 +54,28 @@
 // in attention_cuda_fwd.cu: emulated 64-bit division dominated the original
 // col_idx-based inner loop).
 //
-// Only the generic (any channel count) variant is provided. The product-grid file
-// also carries a register-blocked "special" variant for channel counts that fit in
-// MAX_LOCAL_ARR_LEN; adding the ragged equivalent is a pure performance question and
-// is deliberately left until the benchmark says it is worth the code.
+// The benchmark has now said it is worth the code, so both variants are provided.
+//
+// The generic kernel below keeps one neighbour in flight at a time: address, load k,
+// warp reduce, softmax, load v, with every step depending on the one before. That is
+// the same structure attention_cuda_fwd.cu describes having replaced on the product
+// grids, and it measures the same way -- 1.6 TFLOP/s at HEALPix level 5 on GB300,
+// 0.02% of tensor-core peak and under 1% of HBM, so bound by neither arithmetic nor
+// bandwidth but by the latency of a dependency chain 102 neighbours long. The
+// accumulator sitting in shared memory puts a read-modify-write inside that chain as
+// well, and q is re-read from global on every neighbour because the channel loop has
+// a runtime bound and cannot be hoisted.
+//
+// s2_attn_fwd_ragged_special_vec_k is the port of the product-grid fix: the output
+// accumulator moves to registers, q is staged once, and neighbours are processed in
+// groups of NB so that NB independent k loads are outstanding before any is consumed.
+// The online softmax then runs once per group rather than once per neighbour, which
+// is the same reduction with one rescale per group instead of NB of them.
+//
+// It applies when the per-head channel count fits NLOC registers per lane and q/k and
+// v agree on it; the generic kernel remains for everything else and as an escape
+// hatch, since only the last of NLOC registers is bounds-checked and that argument
+// depends on NLOC being exactly DIV_UP(nchan, BDIM_X).
 
 #include "attention_cuda.cuh"
 #include <ATen/Dispatch.h>
@@ -76,11 +94,32 @@
 #include <cub/cub.cuh>
 #include <limits>
 #include <cfloat>
+#include <cstdlib>
 
 #include "cudamacro.h"
 #include "attention_cuda_utils.cuh"
 
-#define THREADS (64)
+// Threads per block, and so warps per block, since BDIM_X is a warp. Overridable
+// because the ragged kernel wants it swept independently of the product-grid one:
+// warps in a block take consecutive output points, adjacent points share 74% of
+// their neighbours by measurement, and so a wider block turns L1 into a shared cache
+// for that overlap. The product grid has no equivalent gain and settled on 64.
+#ifndef TH_ATTENTION_RAGGED_THREADS
+#define TH_ATTENTION_RAGGED_THREADS (64)
+#endif
+#define THREADS (TH_ATTENTION_RAGGED_THREADS)
+
+// Neighbours per group in the special kernel. Buys memory-level parallelism at the
+// cost of NB accumulator sets, and this kernel's occupancy is register-limited, so
+// it is the other half of the sweep.
+#ifndef TH_ATTENTION_RAGGED_NB
+#define TH_ATTENTION_RAGGED_NB (4)
+#endif
+
+// Largest number of COMPUTE_T registers per lane the special kernel will hold for
+// the accumulator. 16 matches MAX_LOCAL_ARR_LEN in attention_cuda_fwd.cu, so with a
+// 32-lane BDIM_X it covers up to 512 channels per head; HEALDA's dit-5B runs 96.
+#define MAX_LOCAL_ARR_LEN_RAGGED (16)
 
 namespace attention_kernels
 {
@@ -194,6 +233,251 @@ namespace attention_kernels
         return;
     }
 
+    // Register-blocked, group-scheduled counterpart of the kernel above. The port of
+    // s2_attn_fwd_special_vec_k in attention_cuda_fwd.cu; everything that differs is
+    // addressing, because a ragged arc walks a contiguous run of one ring rather than
+    // a longitude run of a product row, so there is no (ho, wo) decomposition, no
+    // pscale and no wrap_lon -- just a column that counts and wraps at the ring end.
+    //
+    // NLOC must be exactly DIV_UP(nchan, BDIM_X). The unrolled loops below leave every
+    // register but the last unguarded, which is sound only under that equality: for
+    // i <= NLOC-2, i*BDIM_X + tidx <= (NLOC-1)*BDIM_X - 1 < nchan. The launcher
+    // enforces it, and requires nchan_in == nchan_out so one NLOC serves both.
+    template <int BDIM_X, int BDIM_Y, int NLOC, typename STORAGE_T>
+    __global__ __launch_bounds__(BDIM_X *BDIM_Y) void s2_attn_fwd_ragged_special_vec_k(
+        int nheads,    // no. of attention heads packed along the channel dim
+        int nchan_in,  // no. of STORAGE_T elements along channel dim, per head
+        int nchan_out, // no. of STORAGE_T elements along channel dim, per head
+        int64_t npoints_in, int64_t npoints_out, const STORAGE_T *__restrict__ kx,
+        const STORAGE_T *__restrict__ vx, const STORAGE_T *__restrict__ qy, const int32_t *__restrict__ seg,
+        const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
+        const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y)
+    {
+        using COMPUTE_T = typename vec_traits<STORAGE_T>::compute_t;
+
+        static_assert(BDIM_X == WARP_SIZE, "the ragged special kernel reduces with __warp_sum");
+        static_assert(NLOC >= 1);
+
+        constexpr int NLOC_M1 = NLOC - 1;
+        constexpr int NB = TH_ATTENTION_RAGGED_NB;
+
+        // q staged per warp, so the neighbour loop reads it from shared instead of
+        // re-reading global on every one of the ~102 iterations.
+        extern __shared__ __align__(sizeof(float4)) float shext[];
+        COMPUTE_T *shq = reinterpret_cast<COMPUTE_T *>(shext) + threadIdx.y * nchan_in;
+
+        const int tidx = threadIdx.x;
+
+        const int bh = blockIdx.y;
+        const int batch = bh / nheads;
+        const int head = bh - (batch * nheads);
+
+        const int64_t ldi = int64_t(nheads) * nchan_in;
+        const int64_t ldo = int64_t(nheads) * nchan_out;
+
+        const int64_t ipoint = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
+
+        if (ipoint >= npoints_out) { return; }
+
+        qy += int64_t(batch) * npoints_out * ldi + int64_t(head) * nchan_in + ipoint * ldi;
+
+        for (int chan = tidx; chan < nchan_in; chan += BDIM_X) { shq[chan] = vload(qy, chan); }
+        // Lanes read each other's entries below, and a warp is not implicitly in step
+        // on every architecture.
+        __syncwarp();
+
+        // the lane's channel offset folded into the base pointers, as on the product
+        // grid, so the inner loops index by register rather than by channel
+        kx += int64_t(batch) * npoints_in * ldi + int64_t(head) * nchan_in + tidx;
+        vx += int64_t(batch) * npoints_in * ldo + int64_t(head) * nchan_out + tidx;
+        y += int64_t(batch) * npoints_out * ldo + int64_t(head) * nchan_out + ipoint * ldo + tidx;
+
+        COMPUTE_T locy[NLOC];
+#pragma unroll
+        for (int i = 0; i < NLOC; i++) { locy[i] = __vset<COMPUTE_T>(0.f); }
+
+        float alpha_sum = 0.0f;
+        float qdotk_max = -FLT_MAX;
+
+        const int seg_beg = seg_off[ipoint];
+        const int seg_end = seg_off[ipoint + 1];
+
+        for (int sg = seg_beg; sg < seg_end; sg++) {
+
+            const int iring = seg[3 * sg + 0];
+            const int lo = seg[3 * sg + 1];
+            const int len = seg[3 * sg + 2];
+
+            const float qw_seg = ring_weights[iring];
+
+            const int64_t ring_lo = ring_base[iring];
+            const int64_t ring_hi = ring_lo + ring_size[iring];
+
+            int64_t col = ring_lo + lo;
+
+            int j = 0;
+            for (; j + NB <= len; j += NB) {
+
+                // addresses first, so the NB loads that follow have nothing to wait on
+                const STORAGE_T *kp[NB];
+                const STORAGE_T *vp[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    kp[u] = kx + col * ldi;
+                    vp[u] = vx + col * ldo;
+                    if (++col == ring_hi) { col = ring_lo; }
+                }
+
+                COMPUTE_T acc[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) { acc[u] = __vset<COMPUTE_T>(0.f); }
+
+                // one channel step feeds NB accumulators, so NB k loads are in flight
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    const COMPUTE_T q = shq[i * BDIM_X + tidx];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) { acc[u] = __vadd(acc[u], __vmul(q, vload(kp[u], i * BDIM_X))); }
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    const COMPUTE_T q = shq[NLOC_M1 * BDIM_X + tidx];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        acc[u] = __vadd(acc[u], __vmul(q, vload(kp[u], NLOC_M1 * BDIM_X)));
+                    }
+                }
+
+                float qdotk[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) { qdotk[u] = __warp_sum(__vred(acc[u])); }
+
+                // group-wise online softmax: one running max and one rescale for all NB
+                float qdotk_max_tmp = qdotk_max;
+#pragma unroll
+                for (int u = 0; u < NB; u++) { qdotk_max_tmp = max(qdotk_max_tmp, qdotk[u]); }
+                const float exp_save = expf(qdotk_max - qdotk_max_tmp);
+
+                float alpha[NB];
+                float alpha_grp = 0.0f;
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    alpha[u] = expf(qdotk[u] - qdotk_max_tmp) * qw_seg;
+                    alpha_grp += alpha[u];
+                }
+                alpha_sum = alpha_grp + alpha_sum * exp_save;
+
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    COMPUTE_T t = __vscale(exp_save, locy[i]);
+#pragma unroll
+                    for (int u = 0; u < NB; u++) { t = __vadd(t, __vscale(alpha[u], vload(vp[u], i * BDIM_X))); }
+                    locy[i] = t;
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                    COMPUTE_T t = __vscale(exp_save, locy[NLOC_M1]);
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        t = __vadd(t, __vscale(alpha[u], vload(vp[u], NLOC_M1 * BDIM_X)));
+                    }
+                    locy[NLOC_M1] = t;
+                }
+
+                qdotk_max = qdotk_max_tmp;
+            }
+
+            // remainder: fewer than NB neighbours left in this arc
+            for (; j < len; j++) {
+
+                const STORAGE_T *_kx = kx + col * ldi;
+                const STORAGE_T *_vx = vx + col * ldo;
+
+                COMPUTE_T qdotkv = __vset<COMPUTE_T>(0.f);
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    qdotkv = __vadd(qdotkv, __vmul(shq[i * BDIM_X + tidx], vload(_kx, i * BDIM_X)));
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    qdotkv = __vadd(qdotkv, __vmul(shq[NLOC_M1 * BDIM_X + tidx], vload(_kx, NLOC_M1 * BDIM_X)));
+                }
+
+                const float qdotk = __warp_sum(__vred(qdotkv));
+
+                const float qdotk_max_tmp = max(qdotk_max, qdotk);
+                const float alpha = expf(qdotk - qdotk_max_tmp) * qw_seg;
+                const float exp_save = expf(qdotk_max - qdotk_max_tmp);
+
+                alpha_sum = alpha + alpha_sum * exp_save;
+
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    locy[i] = __vadd(__vscale(exp_save, locy[i]), __vscale(alpha, vload(_vx, i * BDIM_X)));
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                    locy[NLOC_M1]
+                        = __vadd(__vscale(exp_save, locy[NLOC_M1]), __vscale(alpha, vload(_vx, NLOC_M1 * BDIM_X)));
+                }
+
+                qdotk_max = qdotk_max_tmp;
+
+                if (++col == ring_hi) { col = ring_lo; }
+            }
+        }
+
+        const float alpha_inv = 1.0f / alpha_sum;
+#pragma unroll
+        for (int i = 0; i < NLOC_M1; i++) { vstore(y, i * BDIM_X, __vscale(alpha_inv, locy[i])); }
+        if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+            vstore(y, NLOC_M1 * BDIM_X, __vscale(alpha_inv, locy[NLOC_M1]));
+        }
+
+        return;
+    }
+
+    // Resolve NLOC, which has to be a compile-time constant, from the runtime channel
+    // count by walking the supported range. Mirrors launch_spc_attn_fwd.
+    template <int BDIM_X, int BDIM_Y, int CUR_LOC, int MAX_LOC, typename STORAGE_T>
+    static void launch_spc_attn_fwd_ragged(int nloc, int batch_size, int nheads, int nchans_in, int nchans_out,
+                                           int64_t npoints_in, int64_t npoints_out, const STORAGE_T *__restrict__ _kxp,
+                                           const STORAGE_T *__restrict__ _vxp, const STORAGE_T *__restrict__ _qyp,
+                                           const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
+                                           const int64_t *_ring_size, const float *_ring_weights,
+                                           STORAGE_T *__restrict__ _yp, cudaStream_t stream)
+    {
+        if constexpr (CUR_LOC > MAX_LOC) {
+            TORCH_CHECK(false, "ragged special attention kernel reached nloc ", nloc, " above its bound ", MAX_LOC);
+            return;
+        } else {
+            if (CUR_LOC == nloc) {
+                dim3 block(BDIM_X, BDIM_Y);
+                dim3 grid(DIV_UP(npoints_out, block.y), batch_size * nheads);
+
+                // only q is staged; the accumulator is in registers, which is the point
+                size_t shsize = sizeof(typename vec_traits<STORAGE_T>::compute_t) * nchans_in * block.y;
+
+                s2_attn_fwd_ragged_special_vec_k<BDIM_X, BDIM_Y, CUR_LOC><<<grid, block, shsize, stream>>>(
+                    nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg, _seg_off,
+                    _ring_base, _ring_size, _ring_weights, _yp);
+                CHECK_ERROR("s2_attn_fwd_ragged_special_vec_k");
+                return;
+            }
+            launch_spc_attn_fwd_ragged<BDIM_X, BDIM_Y, CUR_LOC + 1, MAX_LOC, STORAGE_T>(
+                nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg,
+                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, stream);
+        }
+    }
+
+    // Set TORCH_HARMONICS_RAGGED_GENERIC=1 to force the original kernel. The two
+    // compute the same function, so this is an A/B switch for the benchmark and a way
+    // to fall back without rebuilding if the register-blocked path misbehaves.
+    static bool ragged_force_generic()
+    {
+        static const bool forced = []() {
+            const char *env = std::getenv("TORCH_HARMONICS_RAGGED_GENERIC");
+            return env != nullptr && env[0] == '1';
+        }();
+        return forced;
+    }
+
     template <typename STORAGE_T>
     static void launch_gen_attn_fwd_ragged(int batch_size, int nheads, int nchans_in, int nchans_out,
                                            int64_t npoints_in, int64_t npoints_out, const STORAGE_T *__restrict__ _kxp,
@@ -202,6 +486,17 @@ namespace attention_kernels
                                            const int64_t *_ring_size, const float *_ring_weights,
                                            STORAGE_T *__restrict__ _yp, cudaStream_t stream)
     {
+        // The register-blocked kernel needs NLOC == DIV_UP(nchan, WARP_SIZE) to hold for
+        // both channel counts at once, which is why the equality is required rather
+        // than taking the larger: NLOC also decides which registers go unguarded.
+        const int nloc = DIV_UP(nchans_out, WARP_SIZE);
+        if (!ragged_force_generic() && nchans_in == nchans_out && nloc <= MAX_LOCAL_ARR_LEN_RAGGED) {
+            launch_spc_attn_fwd_ragged<WARP_SIZE, THREADS / WARP_SIZE, 1, MAX_LOCAL_ARR_LEN_RAGGED, STORAGE_T>(
+                nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg,
+                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, stream);
+            return;
+        }
+
         dim3 block(WARP_SIZE, THREADS / WARP_SIZE);
         // one block row per (batch, head) pair
         dim3 grid(DIV_UP(npoints_out, block.y), batch_size * nheads);
@@ -264,6 +559,13 @@ namespace attention_kernels
                     qy.scalar_type(), ")");
         TORCH_CHECK(vx.scalar_type() == qy.scalar_type(), "v dtype (", vx.scalar_type(), ") must match q dtype (",
                     qy.scalar_type(), ")");
+
+        // ring_weights is read as float32 whatever scalar_t the dispatch picks, so it
+        // is the one tensor that must not follow the activations. Casting a whole
+        // module to bf16 would sweep it along, and reinterpreting those bytes as float
+        // computes silent garbage instead of failing.
+        TORCH_CHECK(ring_weights.scalar_type() == at::kFloat, "ring_weights must be float32, got ",
+                    ring_weights.scalar_type());
 
         // per-head channel counts; the packed extent is num_heads times these
         const int nchans_in = qy.size(2) / num_heads; // or kx.size(2) / num_heads
