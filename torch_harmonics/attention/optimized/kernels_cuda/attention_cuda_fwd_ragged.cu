@@ -110,8 +110,21 @@
 #define THREADS (TH_ATTENTION_RAGGED_THREADS)
 
 // Neighbours per group in the special kernel. Buys memory-level parallelism at the
-// cost of NB accumulator sets, and this kernel's occupancy is register-limited, so
-// it is the other half of the sweep.
+// cost of NB accumulator sets, and this kernel's occupancy is register-limited.
+//
+// 4 is where ptxas puts the boundary, for nchan 96 (NLOC 3) at sm_100a:
+//
+//   NB    registers   spill   warps/SM
+//    2       48         0        42
+//    4       48         0        42
+//    8       64        12        32
+//
+// so 4 is free relative to 2 and doubles the loads in flight, while 8 spills the
+// accumulator to local memory, which defeats the purpose of holding it in registers.
+// For reference the generic kernel needs 56 registers and gets 36 warps/SM, so the
+// register-blocked kernel is cheaper despite keeping the accumulator in registers:
+// the shared-memory addressing and the per-neighbour q reload it removes cost
+// registers of their own. See benchmarks/ptxas_register_report.py.
 #ifndef TH_ATTENTION_RAGGED_NB
 #define TH_ATTENTION_RAGGED_NB (4)
 #endif
