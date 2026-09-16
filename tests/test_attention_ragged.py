@@ -188,6 +188,31 @@ class TestRaggedNeighborhoodAttentionS2(unittest.TestCase):
             [8, 4, 1, 4, 4, 2, False, True],
             [4, 8, 1, 4, 4, 2, False, True],
             [2, 4, 2, 4, 4, 1, False, True],
+            # Channel counts that reach the register-blocked CUDA kernel.
+            #
+            # Every case above has at most 32 channels per head, so NLOC, which is
+            # DIV_UP(channels per head, 32), is 1 for all of them. At NLOC == 1 the
+            # kernel's unrolled loops run from 0 to NLOC-1 == 0, i.e. not at all, and
+            # only the bounds-guarded tail iteration executes. So none of those cases
+            # touch the unguarded register indexing that the whole kernel rests on --
+            # it is sound only because i <= NLOC-2 implies i*32 + tidx < nchan, and an
+            # off-by-one there reads a neighbouring channel block and still returns a
+            # smooth, plausible field.
+            #
+            # 96 per head is what healda's dit-5B runs, and is an exact multiple of the
+            # warp, so it never exercises the guard on the final register; 80 and 40
+            # leave that one partial (only 16 and 8 lanes of the last register are in
+            # range) and are here for the boundary. 192 over 2 heads puts NLOC > 1 and
+            # a head offset together, since the head stride is what the unrolled
+            # indexing is added to.
+            [4, 4, 1, 96, 96, 1, False, True],   # NLOC 3, exact
+            [4, 4, 1, 80, 80, 1, False, True],   # NLOC 3, last register partial
+            [4, 4, 1, 40, 40, 1, False, True],   # NLOC 2, last register partial
+            [4, 4, 1, 192, 192, 2, False, True], # NLOC 3, two heads
+            # Unequal counts at a large channel width, which the register-blocked
+            # kernel refuses (it needs one NLOC to serve both), so this pins the
+            # generic fallback on the sizes that now bypass it.
+            [4, 4, 1, 96, 64, 1, False, True],
         ],
         skip_on_empty=True,
     )
@@ -313,16 +338,24 @@ class TestRaggedNeighborhoodAttentionS2(unittest.TestCase):
             test_utils=("test_schema", "test_autograd_registration", "test_faketensor"),
         )
 
-    def test_it_rejects_a_mix_of_ragged_and_regular_grids(self):
+    def test_a_mixed_pair_takes_the_ragged_path_and_keeps_each_layout(self):
         """
-        The two paths key their neighbourhood differently, so a mixed pair is refused
-        rather than silently taking one of them.
+        A mixed pair is computed by the ragged path, because keying the neighbourhood
+        by output point is the general choice and a regular grid admits it too. What
+        each side must not lose is its own layout: the ragged side stays flat and the
+        regular side keeps its two spatial axes.
         """
-        with self.assertRaisesRegex(ValueError, "both be regular or both be ragged"):
-            NeighborhoodAttentionS2(grid_in=HealpixGrid(nside=2), grid_out=as_grid("equiangular", (6, 12)), in_channels=4)
+        hpx, eqa = HealpixGrid(nside=2), as_grid("equiangular", (6, 12))
 
-        with self.assertRaisesRegex(ValueError, "both be regular or both be ragged"):
-            NeighborhoodAttentionS2(grid_in=as_grid("equiangular", (6, 12)), grid_out=HealpixGrid(nside=2), in_channels=4)
+        decode = NeighborhoodAttentionS2(grid_in=hpx, grid_out=eqa, in_channels=4)
+        self.assertTrue(decode.ragged)
+        self.assertTrue(decode.ragged_in)
+        self.assertFalse(decode.ragged_out)
+
+        encode = NeighborhoodAttentionS2(grid_in=eqa, grid_out=hpx, in_channels=4)
+        self.assertTrue(encode.ragged)
+        self.assertFalse(encode.ragged_in)
+        self.assertTrue(encode.ragged_out)
 
     def test_it_rejects_inputs_of_the_wrong_rank_or_extent(self):
         """A ragged field is flat, so the module wants 3 dims and the right point count."""
@@ -367,6 +400,127 @@ class TestRaggedNeighborhoodAttentionS2(unittest.TestCase):
                     got[ipoint, model.psi_col_idx[model.psi_roff_idx[ipoint] : model.psi_roff_idx[ipoint + 1]]] = True
 
                 self.assertTrue(torch.equal(got, expected))
+
+
+@parameterized_class(("device"), _devices)
+class TestMixedGridNeighborhoodAttentionS2(unittest.TestCase):
+    """
+    Attention between a ragged grid and a product grid: the encoder and decoder case.
+
+    The neighbourhood is keyed by output point whichever way the resampling goes, so
+    the ragged path serves both and there is no new mathematics here. What is new is
+    that the two sides carry different layouts, and the thing that can go wrong is the
+    flattening: a regular grid enters the ragged path as ``ilat * nlon + ilon``, and if
+    that disagreed with the order the neighbourhood indexes, the result would be a
+    plausible-looking field built from the wrong neighbours. The oracle below is the
+    same dense masked softmax the pure-ragged tests use, addressed in flat indices
+    throughout, so it pins the ordering rather than assuming it.
+    """
+
+    def setUp(self):
+        disable_tf32()
+        set_seed(333)
+
+    @parameterized.expand(
+        [
+            # Format: [name, grid_in, grid_out]. Both directions, and both families
+            # in the output role, since only the output side gets unflattened again.
+            ["decode", HealpixGrid(nside=4), as_grid("equiangular", (16, 32))],
+            ["encode", as_grid("equiangular", (16, 32)), HealpixGrid(nside=4)],
+            ["decode_to_lobatto", HealpixGrid(nside=4), as_grid("lobatto", (15, 30))],
+            ["decode_coarser", HealpixGrid(nside=8), as_grid("equiangular", (12, 24))],
+        ],
+        skip_on_empty=True,
+    )
+    def test_it_matches_a_dense_masked_softmax(self, name, grid_in, grid_out, atol=1e-5, rtol=1e-4):
+        """Forward and every gradient, against the oracle, in flat index space."""
+        batch, channels, heads = 2, 8, 2
+        model = NeighborhoodAttentionS2(
+            grid_in=grid_in, grid_out=grid_out, in_channels=channels, num_heads=heads
+        ).to(self.device)
+
+        mask = _brute_force_neighborhood(grid_in, grid_out, model.theta_cutoff).to(self.device)
+        # an output point with an empty neighbourhood would make the oracle's softmax
+        # divide by zero, which would look like a module bug rather than a test one
+        self.assertTrue(bool(mask.any(dim=-1).all()), f"{name}: some output point has no neighbours")
+
+        # The leaves are flat for both the module and the oracle, and the module's
+        # view is a reshape of the same leaf. That way the gradients come back in one
+        # layout and comparing them needs no reinterpretation of its own.
+        def leaf(npoints):
+            return torch.randn(batch, channels, npoints, device=self.device, requires_grad=True)
+
+        flat = {"q": leaf(grid_out.npoints), "k": leaf(grid_in.npoints), "v": leaf(grid_in.npoints)}
+        flat_ref = {name_: t.detach().clone().requires_grad_() for name_, t in flat.items()}
+
+        def as_grid_shape(tensor, grid):
+            return tensor if not grid.is_regular else tensor.unflatten(-1, grid.shape)
+
+        out = model(
+            as_grid_shape(flat["q"], grid_out), as_grid_shape(flat["k"], grid_in), as_grid_shape(flat["v"], grid_in)
+        )
+
+        expected_shape = (batch, model.out_channels, *grid_out.spatial_shape)
+        self.assertEqual(tuple(out.shape), expected_shape, f"{name}: output must be laid out on grid_out")
+
+        out_ref = _dense_masked_attention(model, flat_ref["q"], flat_ref["k"], flat_ref["v"], mask)
+
+        out_flat = out.reshape(batch, model.out_channels, grid_out.npoints)
+        self.assertTrue(compare_tensors("output", out_flat, out_ref, atol=atol, rtol=rtol))
+
+        # one backward per graph, from the same upstream gradient
+        grad = torch.randn_like(out_ref)
+        grads_ref = torch.autograd.grad(
+            out_ref, list(flat_ref.values()) + list(model.parameters()), grad_outputs=grad, retain_graph=True
+        )
+        grads = torch.autograd.grad(
+            out_flat, list(flat.values()) + list(model.parameters()), grad_outputs=grad
+        )
+
+        names = list(flat.keys()) + [pname for pname, _ in model.named_parameters()]
+        for pname, got, expected in zip(names, grads, grads_ref):
+            self.assertTrue(compare_tensors(f"grad {pname}", got, expected, atol=atol, rtol=rtol))
+
+    def test_the_flattening_is_ring_major(self):
+        """
+        The ordering assumption, on its own so that a violation of it is not diagnosed
+        as an attention bug.
+
+        ``GridS2.lon_offsets`` places ``(ilat, ilon)`` at ``lon_offsets[ilat] + ilon``,
+        which on a regular grid is ``ilat * nlon + ilon``. That is what the layer
+        relies on when it reshapes a regular field into the flat axis the
+        neighbourhood indexes.
+        """
+        grid = as_grid("equiangular", (6, 12))
+        offsets = grid.lon_offsets
+        for ilat in range(grid.nlat):
+            for ilon in (0, 1, grid.nlon - 1):
+                self.assertEqual(int(offsets[ilat]) + ilon, ilat * grid.nlon + ilon)
+
+        field = torch.arange(grid.npoints, dtype=torch.float32).reshape(grid.nlat, grid.nlon)
+        self.assertTrue(torch.equal(field.flatten(-2, -1), torch.arange(grid.npoints, dtype=torch.float32)))
+
+    def test_a_constant_field_decodes_to_a_constant_field(self):
+        """
+        The decoder's sanity check. Attention weights are a partition of unity, so a
+        constant input must come back constant on the output grid whatever the
+        neighbourhoods look like -- including at the poles, where an equiangular grid
+        stacks many output points onto nearly the same place.
+        """
+        grid_in, grid_out = HealpixGrid(nside=4), as_grid("equiangular", (16, 32))
+        model = NeighborhoodAttentionS2(
+            grid_in=grid_in, grid_out=grid_out, in_channels=4, num_heads=1, bias=False
+        ).to(self.device)
+
+        # with no biases and a constant input, every value vector is the same, so the
+        # output is that vector projected -- independent of the softmax entirely
+        const = torch.full((1, 4, grid_in.npoints), 0.75, device=self.device)
+        query = torch.full((1, 4, *grid_out.shape), 0.75, device=self.device)
+        out = model(query, const, const)
+
+        self.assertEqual(tuple(out.shape), (1, 4, *grid_out.shape))
+        spread = (out - out.amin(dim=(-2, -1), keepdim=True)).abs().max().detach()
+        self.assertLess(float(spread), 1e-5, "a constant field did not decode to a constant field")
 
 
 class TestRaggedKernelAgainstRegularKernel(unittest.TestCase):
