@@ -104,6 +104,46 @@
 #endif
 #define THREADS (TH_ATTENTION_RAGGED_BWD_THREADS)
 
+// Neighbours per group in the special kernel's two arc walks, the backward's
+// counterpart of TH_ATTENTION_RAGGED_NB.
+//
+// Neither the product-grid backward nor the first ragged port grouped at all, so
+// both walked one neighbour at a time: address, load k and v, two warp reductions,
+// softmax update, next. That is the same fully serial chain the forward was
+// measured at 1.6 TFLOP/s with, and after the forward was fixed the backward is
+// what remains -- 4.05 ms of the 5.36 ms fwd+bwd at nside 64, i.e. 76%.
+//
+// Setting this to 1 recovers the ungrouped kernel exactly, which is the escape
+// hatch if the grouped arithmetic ever looks suspect; TORCH_HARMONICS_RAGGED_BWD_
+// GENERIC=1 remains the coarser one.
+//
+// Unlike the forward, the choice here is a real trade rather than a free lunch.
+// For nchan 96 (NLOC 3), fp32, sm_100a:
+//
+//   NB   registers   spill   warps/SM
+//    1       56        0        36
+//    2       64        0        32
+//    4       72        0        28
+//
+// The forward got NB 4 for the same register count as NB 2, so nothing was given
+// up. This kernel already holds four register accumulators per lane before any
+// grouping, so every doubling costs 8 registers and about four resident warps:
+// NB 4 buys four times the loads in flight at 44% occupancy instead of 56%.
+// Nothing spills, which was the thing that would have made it pointless.
+//
+// 4 is the default on the usual argument that memory-level parallelism per thread
+// beats occupancy for a latency-bound kernel, but that is a prediction, not a
+// measurement, and it is the one number here a GPU still has to settle. Sweeping
+// needs no source edit:
+//
+//   NVCC_APPEND_FLAGS="-DTH_ATTENTION_RAGGED_BWD_NB=2" python setup.py build_ext --inplace
+//
+// NB 1 measuring 56 registers, exactly what the kernel used before grouping, is
+// the check that the escape hatch really is the old code.
+#ifndef TH_ATTENTION_RAGGED_BWD_NB
+#define TH_ATTENTION_RAGGED_BWD_NB (4)
+#endif
+
 // Largest number of COMPUTE_T registers per lane the special kernel will hold for
 // one accumulator. 16 matches MAX_LOCAL_ARR_LEN in attention_cuda_bwd.cu, so with a
 // 32-lane BDIM_X it covers up to 512 channels per head; HEALDA's dit-5B runs 96.
@@ -425,6 +465,8 @@ namespace attention_kernels
         static_assert(NLOC >= 1);
 
         constexpr int NLOC_M1 = NLOC - 1;
+        constexpr int NB = TH_ATTENTION_RAGGED_BWD_NB;
+        static_assert(NB >= 1);
 
         const int tidx = threadIdx.x;
 
@@ -545,7 +587,125 @@ namespace attention_kernels
 
             int64_t col = ring_lo + seg_lo;
 
-            for (int j = 0; j < seg_len; j++) {
+            // Grouped body: NB neighbours' addresses are formed first so their k and
+            // v loads are all outstanding before any is consumed, and the online
+            // softmax then rescales once per group instead of once per neighbour.
+            //
+            // This is the one place in the backward where grouping changes the
+            // arithmetic. Rescaling per group rather than per neighbour is the same
+            // reduction in exact arithmetic but a different order of fp32 sums, so
+            // the gradient differs in its last bits. That is why this lands now and
+            // not with the original port: the oracle gradient checks at 96 channels
+            // per head exist and pass, so the change is finally testable.
+            int j = 0;
+            for (; j + NB <= seg_len; j += NB) {
+
+                const STORAGE_T *kp[NB];
+                const STORAGE_T *vp[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    kp[u] = kx + col * ldi;
+                    vp[u] = vx + col * ldo;
+                    if (++col == ring_hi) { col = ring_lo; }
+                }
+
+                COMPUTE_T qdotk_g[NB];
+                COMPUTE_T gdotv_g[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    qdotk_g[u] = __vset<COMPUTE_T>(0.0f);
+                    gdotv_g[u] = __vset<COMPUTE_T>(0.0f);
+                }
+
+                // one channel step feeds 2*NB accumulators, so that many loads are
+                // outstanding per step rather than two
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    const COMPUTE_T q = loc_qy[i];
+                    const COMPUTE_T d = loc_dy[i];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], i * BDIM_X)));
+                        gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], i * BDIM_X)));
+                    }
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    const COMPUTE_T q = loc_qy[NLOC_M1];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], NLOC_M1 * BDIM_X)));
+                    }
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                    const COMPUTE_T d = loc_dy[NLOC_M1];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], NLOC_M1 * BDIM_X)));
+                    }
+                }
+
+                float qdotk_b[NB];
+                float gdotv_b[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    qdotk_b[u] = __warp_sum(__vred(qdotk_g[u]));
+                    gdotv_b[u] = __warp_sum(__vred(gdotv_g[u]));
+                }
+
+                float qdotk_max_grp = qdotk_max;
+#pragma unroll
+                for (int u = 0; u < NB; u++) { qdotk_max_grp = max(qdotk_max_grp, qdotk_b[u]); }
+                const float mc_grp = expf(qdotk_max - qdotk_max_grp);
+
+                // ag[u] is alpha_inz * gdotv, wanted once for the scalar recurrences
+                // and again for each of the NLOC register accumulators
+                float alpha_b[NB];
+                float ag_b[NB];
+                float alpha_grp = 0.0f;
+                float ag_grp = 0.0f;
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    alpha_b[u] = expf(qdotk_b[u] - qdotk_max_grp) * qw_seg;
+                    ag_b[u] = alpha_b[u] * gdotv_b[u];
+                    alpha_grp += alpha_b[u];
+                    ag_grp += ag_b[u];
+                }
+
+                alpha_sum = alpha_sum * mc_grp + alpha_grp;
+                integral = integral * mc_grp + ag_grp;
+                alpha_vw_ = alpha_vw_ * mc_grp + ag_grp;
+
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    COMPUTE_T k_acc = __vscale(mc_grp, loc_k__[i]);
+                    COMPUTE_T kvw_acc = __vscale(mc_grp, loc_kvw[i]);
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        const COMPUTE_T kxval = vload(kp[u], i * BDIM_X);
+                        k_acc = __vadd(k_acc, __vscale(alpha_b[u], kxval));
+                        kvw_acc = __vadd(kvw_acc, __vscale(ag_b[u], kxval));
+                    }
+                    loc_k__[i] = k_acc;
+                    loc_kvw[i] = kvw_acc;
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    COMPUTE_T k_acc = __vscale(mc_grp, loc_k__[NLOC_M1]);
+                    COMPUTE_T kvw_acc = __vscale(mc_grp, loc_kvw[NLOC_M1]);
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        const COMPUTE_T kxval = vload(kp[u], NLOC_M1 * BDIM_X);
+                        k_acc = __vadd(k_acc, __vscale(alpha_b[u], kxval));
+                        kvw_acc = __vadd(kvw_acc, __vscale(ag_b[u], kxval));
+                    }
+                    loc_k__[NLOC_M1] = k_acc;
+                    loc_kvw[NLOC_M1] = kvw_acc;
+                }
+
+                qdotk_max = qdotk_max_grp;
+            }
+
+            // remainder: fewer than NB neighbours left in this arc
+            for (; j < seg_len; j++) {
 
                 const STORAGE_T *_kx = kx + col * ldi;
                 const STORAGE_T *_vx = vx + col * ldo;
@@ -634,7 +794,120 @@ namespace attention_kernels
 
             int64_t col = ring_lo + seg_lo;
 
-            for (int j = 0; j < seg_len; j++) {
+            // Grouped, exactly as pass 1 but without the caveat: there is no running
+            // maximum left to update here, so each neighbour's contribution is
+            // computed independently of the others and the sums it feeds are the
+            // atomics, which were never ordered. Grouping this walk is therefore
+            // bit-identical, not merely equivalent in exact arithmetic.
+            int j = 0;
+            for (; j + NB <= seg_len; j += NB) {
+
+                int64_t cols[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    cols[u] = col;
+                    if (++col == ring_hi) { col = ring_lo; }
+                }
+
+                const STORAGE_T *kp[NB];
+                const STORAGE_T *vp[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    kp[u] = kx + cols[u] * ldi;
+                    vp[u] = vx + cols[u] * ldo;
+                }
+
+                COMPUTE_T qdotk_g[NB];
+                COMPUTE_T gdotv_g[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    qdotk_g[u] = __vset<COMPUTE_T>(0.0f);
+                    gdotv_g[u] = __vset<COMPUTE_T>(0.0f);
+                }
+
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    const COMPUTE_T q = loc_qy[i];
+                    const COMPUTE_T d = loc_dy[i];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], i * BDIM_X)));
+                        gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], i * BDIM_X)));
+                    }
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    const COMPUTE_T q = loc_qy[NLOC_M1];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], NLOC_M1 * BDIM_X)));
+                    }
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                    const COMPUTE_T d = loc_dy[NLOC_M1];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], NLOC_M1 * BDIM_X)));
+                    }
+                }
+
+                // all 2*NB reductions before any is consumed, so their shuffles
+                // pipeline instead of alternating with the scatter
+                float qdotk_b[NB];
+                float gdotv_b[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    qdotk_b[u] = __warp_sum(__vred(qdotk_g[u]));
+                    gdotv_b[u] = __warp_sum(__vred(gdotv_g[u]));
+                }
+
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+
+                    const float alpha_inz_u = expf(qdotk_b[u] - qdotk_max) * qw_seg;
+
+                    COMPUTE_T *_dkx = dkx + cols[u] * ldi;
+                    COMPUTE_T *_dvx = dvx + cols[u] * ldo;
+
+                    const float alpha_mul_u = alpha_inz_u * alpha_sum_inv;
+
+                    const float scale_fact_qy = (gdotv_b[u] - integral) * alpha_mul_u;
+                    const float scale_fact_dy = alpha_mul_u;
+
+#if __CUDA_ARCH__ < 900
+                    constexpr int VEC_SIZE = sizeof(COMPUTE_T) / sizeof(float);
+
+                    float *sh_qy_scl = reinterpret_cast<float *>(sh_qy) - tidx * VEC_SIZE;
+                    float *sh_dy_scl = reinterpret_cast<float *>(sh_dy) - tidx * VEC_SIZE;
+                    float *_dkx_scl = reinterpret_cast<float *>(_dkx) - tidx * VEC_SIZE;
+                    float *_dvx_scl = reinterpret_cast<float *>(_dvx) - tidx * VEC_SIZE;
+
+                    for (int chan = tidx; chan < nchan_in * VEC_SIZE; chan += BDIM_X) {
+                        atomicAdd(_dkx_scl + chan, scale_fact_qy * sh_qy_scl[chan]);
+                    }
+                    for (int chan = tidx; chan < nchan_out * VEC_SIZE; chan += BDIM_X) {
+                        atomicAdd(_dvx_scl + chan, scale_fact_dy * sh_dy_scl[chan]);
+                    }
+#else
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        atomicAdd(_dkx + i * BDIM_X, __vscale(scale_fact_qy, loc_qy[i]));
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        atomicAdd(_dkx + NLOC_M1 * BDIM_X, __vscale(scale_fact_qy, loc_qy[NLOC_M1]));
+                    }
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        atomicAdd(_dvx + i * BDIM_X, __vscale(scale_fact_dy, loc_dy[i]));
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                        atomicAdd(_dvx + NLOC_M1 * BDIM_X, __vscale(scale_fact_dy, loc_dy[NLOC_M1]));
+                    }
+#endif
+                }
+            }
+
+            // remainder: fewer than NB neighbours left in this arc
+            for (; j < seg_len; j++) {
 
                 const STORAGE_T *_kx = kx + col * ldi;
                 const STORAGE_T *_vx = vx + col * ldo;
