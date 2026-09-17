@@ -359,17 +359,28 @@ class NeighborhoodAttentionS2(nn.Module):
         # the two are separate paths rather than one path with a flag; see
         # _setup_ragged below and the module docstring of
         # attention.kernels_torch.attention_ragged_torch.
-        self.ragged = not (self.grid_in.is_regular and self.grid_out.is_regular)
+        #
+        # Raggedness is a property of each side on its own, and the two roles it plays
+        # are separable. self.ragged picks the computation, and one ragged grid is
+        # enough to force it for both sides, because the ragged path is the general
+        # one: it keys the neighbourhood by output point, which a regular grid also
+        # admits. ragged_in and ragged_out pick only the layout each side shows the
+        # caller. Splitting them is what lets a HEALPix field decode onto a lat/lon
+        # grid with neither side giving up its natural shape.
+        self.ragged_in = not self.grid_in.is_regular
+        self.ragged_out = not self.grid_out.is_regular
+        self.ragged = self.ragged_in or self.ragged_out
+
+        self.npoints_in = self.grid_in.npoints
+        self.npoints_out = self.grid_out.npoints
 
         if self.ragged:
-            if self.grid_in.is_regular != self.grid_out.is_regular:
-                raise ValueError(
-                    f"grid_in and grid_out must both be regular or both be ragged, got {self.grid_in!r} and {self.grid_out!r}. "
-                    "Mixing the two would need the neighbourhood keyed by output point on one side and by output latitude on the "
-                    "other; resample onto a common grid family first."
-                )
-            self.npoints_in = self.grid_in.npoints
-            self.npoints_out = self.grid_out.npoints
+            # Whichever side is regular keeps its (nlat, nlon), since the layout
+            # conversions need it to flatten and restore that side's spatial axes.
+            if not self.ragged_in:
+                self.nlat_in, self.nlon_in = self.grid_in.shape
+            if not self.ragged_out:
+                self.nlat_out, self.nlon_out = self.grid_out.shape
 
             # The ragged path has one kernel for both directions -- its neighbour list
             # is keyed by output point whichever way the resampling goes -- so unlike
@@ -472,15 +483,30 @@ class NeighborhoodAttentionS2(nn.Module):
         arcs = precompute_neighborhood_arcs_s2(self.grid_in, self.grid_out, self.theta_cutoff)
 
         # The arc form is what the CUDA kernels want; the torch reference walks a plain
-        # column list, which is what keeps it independent of the arc derivation. Take it
-        # from the cache so a stack of blocks on one grid expands the pattern once.
-        col_idx, row_off = precompute_neighborhood_csr_s2(self.grid_in, self.grid_out, self.theta_cutoff)
-        self.register_buffer("psi_col_idx", col_idx, persistent=False)
-        self.register_buffer("psi_roff_idx", row_off, persistent=False)
+        # column list, which is what keeps it independent of the arc derivation.
+        #
+        # The column list is built on demand rather than here, because on the ragged
+        # path it is only ever read by that reference: the CUDA kernels take arcs, and
+        # nothing else touches it. It is also by far the larger of the two -- one entry
+        # per neighbour against one per arc, and an arc averages 12.7 neighbours at
+        # nside 64 -- so at that size it is 139 MiB of the layer's 156 MiB of pattern,
+        # allocated and never read. Sixteen blocks on one grid were carrying 2.2 GiB of
+        # it. (The product-grid path is different: its optimized kernels take the
+        # column list too, so _setup_regular still builds it eagerly.)
+        self._ragged_csr_cache = None
         self.register_buffer("psi_seg", arcs.segments, persistent=False)
         self.register_buffer("psi_seg_off", arcs.offsets, persistent=False)
         self.register_buffer("psi_ring_base", arcs.ring_base, persistent=False)
         self.register_buffer("psi_ring_size", arcs.ring_size, persistent=False)
+
+        # Neighbours per output point, from the arcs, so callers that want the count do
+        # not have to materialise the column list to get it. Segment lengths sum to the
+        # neighbour total by construction.
+        self.register_buffer(
+            "neighbours_per_point",
+            (arcs.segments[:, 2].sum().to(torch.float64) / max(self.npoints_out, 1)).to(torch.float32),
+            persistent=False,
+        )
 
         # Two handles, chosen per call rather than once here, because the ragged
         # kernels are CUDA-only: unlike the product-grid ops there is no CPU
@@ -494,6 +520,30 @@ class NeighborhoodAttentionS2(nn.Module):
         self.optimized_kernel = self.optimized_kernel and _neighborhood_s2_attention_ragged_optimized is not None
         self.attention_handle = _neighborhood_s2_attention_ragged_torch
         self.attention_handle_optimized = _neighborhood_s2_attention_ragged_optimized
+
+    def _ragged_csr(self, device):
+        """
+        The CSR column list, built on first use and cached.
+
+        Only the torch reference needs it, and on a CUDA device with the optimized
+        kernels present that branch is never taken, so building it at setup spent
+        memory proportional to the neighbour count on something nothing read -- 139
+        MiB of a 156 MiB pattern at nside 64. The reference is still reachable, on
+        CPU or with the kernels absent, so it has to be available; it just does not
+        have to be resident.
+
+        Cached on the device it was first asked for. A module moved between devices
+        after the fact rebuilds rather than returning tensors on the wrong one, which
+        register_buffer would have handled but a plain attribute does not.
+        """
+        cached = self._ragged_csr_cache
+        if cached is not None and cached[0].device == device:
+            return cached
+
+        col_idx, row_off = precompute_neighborhood_csr_s2(self.grid_in, self.grid_out, self.theta_cutoff)
+        cached = (col_idx.to(device), row_off.to(device))
+        self._ragged_csr_cache = cached
+        return cached
 
     def _setup_regular(self):
         """Precompute for a latitude/longitude product grid. The original path."""
@@ -563,15 +613,35 @@ class NeighborhoodAttentionS2(nn.Module):
     def extra_repr(self):
         return f"grid_in={self.grid_in!r},\ngrid_out={self.grid_out!r},\nin_channels={self.in_channels}, out_channels={self.out_channels}, k_channels={self.k_channels}, theta_cutoff={self.theta_cutoff}"
 
-    def _to_channels_last(self, tensor: torch.Tensor) -> torch.Tensor:
-        """``(batch, channels, *spatial)`` to ``(batch, *spatial, channels)``."""
+    def _to_channels_last(self, tensor: torch.Tensor, ragged_layout: bool) -> torch.Tensor:
+        """
+        ``(batch, channels, *spatial)`` to ``(batch, points, channels)``.
+
+        ``ragged_layout`` says whether *this tensor's* grid is ragged, which is not
+        the same question as whether the computation is: with a mixed pair the query
+        and the key/value sides answer it differently.
+        """
         # to_nhwc is a tiled kernel for the two-axis case; a ragged field has a single
         # spatial axis, for which a transpose is the whole of it
-        return tensor.transpose(1, 2).contiguous() if self.ragged else to_nhwc(tensor)
+        if not self.ragged:
+            return to_nhwc(tensor)
+        if not ragged_layout:
+            # A regular grid entering the ragged path. Its two spatial axes collapse
+            # into the one flat axis the neighbourhood indexes, and ring-major order is
+            # already that flat order: GridS2.lon_offsets places (ilat, ilon) at
+            # ilat * nlon + ilon on a regular grid, which is what this reshape gives.
+            tensor = tensor.flatten(-2, -1)
+        return tensor.transpose(1, 2).contiguous()
 
     def _to_channels_first(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Inverse of :meth:`_to_channels_last`."""
-        return tensor.transpose(1, 2).contiguous() if self.ragged else to_nchw(tensor)
+        """Inverse of :meth:`_to_channels_last`, on the output grid."""
+        if not self.ragged:
+            return to_nchw(tensor)
+        tensor = tensor.transpose(1, 2).contiguous()
+        if not self.ragged_out:
+            # restore the two spatial axes the caller handed in
+            tensor = tensor.unflatten(-1, (self.nlat_out, self.nlon_out))
+        return tensor
 
     def _head_rms_norm(self, tensor: torch.Tensor, norm_weights: torch.Tensor) -> torch.Tensor:
         """
@@ -591,18 +661,25 @@ class NeighborhoodAttentionS2(nn.Module):
     def _check_inputs(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
         """Shape and dtype contract of the three inputs, for whichever grid kind this is."""
         # change this later to allow arbitrary number of batch dims
-        ndim = 3 if self.ragged else 4
-        for tensor, name in ((query, "query"), (key, "key"), (value, "value")):
-            _check_ndim(tensor, ndim, name)
+        #
+        # query is sampled on the output grid and key/value on the input grid, so a
+        # mixed pair gives the two sides different ranks; each is checked against its
+        # own grid rather than against one rank for the layer.
+        _check_ndim(query, 3 if self.ragged_out else 4, "query")
+        for tensor, name in ((key, "key"), (value, "value")):
+            _check_ndim(tensor, 3 if self.ragged_in else 4, name)
         _check_dtypes_match((query, key, value))
 
-        if self.ragged:
+        if self.ragged_out:
             _check_extent(query, -1, self.npoints_out, "query points")
-            _check_extent(key, -1, self.npoints_in, "key points")
-            _check_extent(value, -1, self.npoints_in, "value points")
         else:
             _check_extent(query, -2, self.nlat_out, "query latitudes")
             _check_extent(query, -1, self.nlon_out, "query longitudes")
+
+        if self.ragged_in:
+            _check_extent(key, -1, self.npoints_in, "key points")
+            _check_extent(value, -1, self.npoints_in, "value points")
+        else:
             _check_extent(key, -2, self.nlat_in, "key latitudes")
             _check_extent(key, -1, self.nlon_in, "key longitudes")
             _check_extent(value, -2, self.nlat_in, "value latitudes")
@@ -616,6 +693,11 @@ class NeighborhoodAttentionS2(nn.Module):
         every signal below is ``(batch, channels, npoints)`` in the flat order of its
         grid -- RING order for :class:`~torch_harmonics.HealpixGrid` -- in place of
         ``(batch, channels, nlat, nlon)``.
+
+        Each side follows its own grid, so the two can differ. Attending from HEALPix
+        onto a lat/lon grid -- decoding -- takes ``key`` and ``value`` as
+        ``(batch, channels, npoints_in)`` and returns ``(batch, out_channels,
+        nlat_out, nlon_out)``, with ``query`` sampled on the output grid as always.
 
         Parameters
         ----------
@@ -666,14 +748,14 @@ class NeighborhoodAttentionS2(nn.Module):
         value_is_query = value is query
         value_is_key = value is key
 
-        query = self._to_channels_last(query)
-        key = query if key_is_query else self._to_channels_last(key)
+        query = self._to_channels_last(query, self.ragged_out)
+        key = query if key_is_query else self._to_channels_last(key, self.ragged_in)
         if value_is_query:
             value = query
         elif value_is_key:
             value = key
         else:
-            value = self._to_channels_last(value)
+            value = self._to_channels_last(value, self.ragged_in)
 
         # perform QKV projections. The stored weights keep their (C_out, C_in, 1, 1)
         # convolution shape so checkpoints stay loadable; the view to (C_out, C_in)
@@ -711,13 +793,14 @@ class NeighborhoodAttentionS2(nn.Module):
                     self.npoints_out,
                 )
             else:
+                col_idx, roff_idx = self._ragged_csr(query_scaled.device)
                 out = self.attention_handle(
                     key,
                     value,
                     query_scaled,
                     self.point_weights,
-                    self.psi_col_idx,
-                    self.psi_roff_idx,
+                    col_idx,
+                    roff_idx,
                     self.num_heads,
                     self.npoints_out,
                 )
