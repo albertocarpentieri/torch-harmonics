@@ -220,12 +220,27 @@ In order, oldest first. All on `acarpentieri/healpix-backend`.
 
 | | forward | fwd+bwd |
 |---|---|---|
-| before any of this | 3.965 ms | 13.543 ms |
-| after `e9092eb` | 1.309 ms | 5.133 ms |
+| before any of this (job 3811782 baseline) | 3.965 ms | 13.543 ms |
+| through `e9092eb` | 1.309 ms | 5.133 ms |
+| through `3ce0d4e` (job 3837708) | 1.283 ms | **3.915 ms** |
 
-**3.0× forward, 2.64× overall.** Peak memory unchanged.
+**3.09× forward, 3.46× overall**, and the backward alone from 9.58 ms to 2.63 ms,
+3.64×. Peak memory unchanged throughout. All four gates green in job 3837708.
 
-The single-pass change (`d0e2b2f`) has **never been measured** — see §7.
+The single-pass collapse was worth 1.31× of that (5.133 → 3.915). Less than the
+halved traversals might suggest, for the reason ptxas gave in advance: it needs 96
+registers against the two-pass 72, so 33% occupancy against 44%.
+
+**Read the arms in job 3837708 with care.** Its baseline row says 10.475 ms, not
+13.543, because `TORCH_HARMONICS_RAGGED_BWD_GENERIC=1` picks the generic *kernel*
+while the one-pass/two-pass choice is a separate switch that defaults to one pass in
+fp32. So the baseline arm now carries the collapse too and the four arms no longer
+isolate what they did. The honest before-number is 13.543 ms from job 3811782.
+
+**None of this is the training configuration.** The benchmark is fp32; training is
+bf16, which routes to the two-pass path (§6), so training gets the forward's 3.09×
+and none of the backward's. That is what makes the §6 trade worth pricing: 1.31× is
+now a measured number to weigh against ~600 MB per layer.
 
 Two things worth knowing about the shape of these results. At nside 32 nothing
 improved at all; the fix targets a serial dependency chain, and at 95 neighbours per
@@ -299,20 +314,22 @@ Build-time, via `NVCC_APPEND_FLAGS`:
 
 ## 7. Immediate next step
 
-**Run the validation gate.** `3ce0d4e` compiles clean on both architectures but has
-not been through the gates, and the single-pass backward has never been timed. One
-job answers both:
+Everything on this branch is validated and measured: job 3837708 passed all four
+gates and gave the numbers in §4. There is no outstanding correctness question.
+
+The next decision is the **bf16 trade in §6** — whether to spend an fp32 copy of the
+forward output, roughly 600 MB per layer at nside 64 with 1536 channels, to get the
+single-pass backward in the dtype training actually uses. The fp32 measurement puts
+the prize at 1.31×, so the question is now properly priced rather than speculative.
+
+If you want to re-measure after any change, the gate is:
 
 ```bash
 cd ~/healda_project
-sbatch sbatch_scripts/rebuild_and_validate_ragged.sh
+sbatch sbatch_scripts/rebuild_and_validate_ragged.sh   # ~50 min, ~40 of it the rebuild
 ```
 
-Expect four green gates. The timings run **fp32**, so they exercise the new
-single-pass path; the number to beat is **5.133 ms** for fwd+bwd at nside 64.
-
-Note the result will not tell you anything about training speed, because training is
-bf16 and bf16 now takes the two-pass path.
+and the number to beat is **3.915 ms** for fwd+bwd at nside 64.
 
 ---
 
