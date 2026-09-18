@@ -5,15 +5,26 @@ Branch: `acarpentieri/healpix-backend` — on the **fork**,
 That trips people up: the NVIDIA remote is also configured here (as `origin` and
 `nvidia-ssh`) and this branch is not on it.
 
-Companion branch: `ac/bench-disk-attn` in the healda worktree `../bench-disk`
-(`gitlab-master.nvidia.com/earth-2/healda`) — benchmarks only, no kernel code.
+Companion branches, both on the healda **fork**
+`gitlab-master.nvidia.com/acarpentieri/healda`, not on `earth-2/healda`:
+
+- `ac/bench-disk-attn` — the benchmarks, on top of MR 56's FlexAttention layer.
+  No kernel code.
+- `ac/nnja-harmonics-latlon` — the healda-side model work: the neighbourhood
+  attention block and the lat/lon decoder. Not needed to run or continue the
+  kernel work, listed so it is not lost.
 
 To get everything:
 
 ```bash
 git clone -b acarpentieri/healpix-backend git@github.com:albertocarpentieri/torch-harmonics.git torch-harmonics-hpx
-git clone -b ac/bench-disk-attn ssh://git@gitlab-master.nvidia.com:12051/earth-2/healda.git bench-disk
+git clone -b ac/bench-disk-attn ssh://git@gitlab-master.nvidia.com:12051/acarpentieri/healda.git bench-disk
 ```
+
+Every branch here lives on a personal fork rather than the upstream project, and
+in both cases the upstream is also configured as a remote in the working copy. So
+looking for this work on `NVIDIA/torch-harmonics` or `earth-2/healda` finds
+nothing, which has already cost one person an afternoon.
 
 This documents where the work stands, how to run it, and what is still open. It is
 written for someone picking it up cold, possibly on a different cluster.
