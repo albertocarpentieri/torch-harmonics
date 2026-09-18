@@ -780,7 +780,11 @@ class NeighborhoodAttentionS2(nn.Module):
                 # The arc kernels take the per-ring weight and the arc encoding; the
                 # torch reference below takes the per-point weight and the CSR column
                 # list. Both describe the same neighbourhood -- see _setup_ragged.
-                out = self.attention_handle_optimized(
+                #
+                # The kernel also returns its softmax statistics, which exist only so
+                # its own backward can use them; autograd carries them, nothing here
+                # does.
+                out, _, _ = self.attention_handle_optimized(
                     key,
                     value,
                     query_scaled,

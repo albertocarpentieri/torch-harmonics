@@ -157,22 +157,34 @@ namespace attention_kernels
         // ring_weights is the per-ring quadrature weight (2*pi*w_ring / n_ring),
         // constant along a ring and therefore hoisted per arc, exactly as
         // quad_weights[hi] is on the product grids.
+        //
+        // Returns (y, alpha_sum, qdotk_max). The two extra outputs are the per-output-
+        // point softmax statistics -- the denominator and the running maximum that
+        // stabilises it -- shaped (B, num_heads, npoints_out) and float32 whatever the
+        // activations are, as ring_weights is and for the same reason. They are saved
+        // rather than discarded because the backward would otherwise spend a whole
+        // traversal of a ~102-point neighbourhood rebuilding two floats; with them it
+        // walks the arcs once. Nothing else consumes them, and the product-grid
+        // `forward` does not have them because its backward has not been given the
+        // same treatment.
         m.def("forward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor ring_weights, Tensor seg, Tensor seg_off, "
-              "Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> Tensor",
+              "Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> (Tensor, Tensor, Tensor)",
               {at::Tag::pt2_compliant_tag});
 
         // dy is inserted after qy, mirroring how `backward` extends `forward` on the
-        // product grids; the psi arguments and their conventions are unchanged from
-        // `forward_ragged` above. Returns (dkx, dvx, dqy).
+        // product grids, and the forward's three returns follow it: y is needed for
+        // integral = dy . y, which is what replaces the backward's first traversal.
+        // The psi arguments and their conventions are unchanged from `forward_ragged`
+        // above. Returns (dkx, dvx, dqy).
         //
         // dkx/dvx are scatter-accumulated with atomicAdd into fp32 buffers and
         // narrowed to the input dtype on return, as in `backward`. Raggedness does
         // not change that: the accumulation is needed because neighbourhoods of
         // distinct output points overlap, which is a property of the neighbourhood
         // and not of the grid being a product grid.
-        m.def("backward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor dy, Tensor ring_weights, Tensor seg, "
-              "Tensor seg_off, Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> "
-              "(Tensor, Tensor, Tensor)",
+        m.def("backward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor dy, Tensor y, Tensor alpha_sum, "
+              "Tensor qdotk_max, Tensor ring_weights, Tensor seg, Tensor seg_off, Tensor ring_base, "
+              "Tensor ring_size, int num_heads, int npoints_out) -> (Tensor, Tensor, Tensor)",
               {at::Tag::pt2_compliant_tag});
 
         // ---- Ring-step variants for DistributedNeighborhoodAttentionS2 ----

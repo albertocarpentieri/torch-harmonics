@@ -691,7 +691,9 @@ class TestRaggedForwardCudaKernel(unittest.TestCase):
         vx = torch.randn(shape, device=self.device, dtype=dtype)
         qy = torch.randn(shape, device=self.device, dtype=dtype)
 
-        got = torch.ops.attention_kernels.forward_ragged(
+        # the op returns its softmax statistics alongside the output; they exist for the
+        # backward's benefit and are checked for shape and dtype below
+        got, alpha_sum, qdotk_max = torch.ops.attention_kernels.forward_ragged(
             kx.contiguous(),
             vx.contiguous(),
             qy.contiguous(),
@@ -703,6 +705,13 @@ class TestRaggedForwardCudaKernel(unittest.TestCase):
             num_heads,
             npix,
         )
+
+        for name, stat in (("alpha_sum", alpha_sum), ("qdotk_max", qdotk_max)):
+            self.assertEqual(stat.shape, (batch, num_heads, npix), name)
+            self.assertEqual(stat.dtype, torch.float32, name)
+        # alpha_sum is a sum of positive terms, and every output point has neighbours
+        self.assertTrue((alpha_sum > 0).all())
+        self.assertTrue(torch.isfinite(qdotk_max).all())
 
         # the reference shares this op's channels-last ABI, so it takes the same
         # tensors; it differs only in consuming the CSR expansion instead of the arcs
@@ -796,6 +805,10 @@ class TestRaggedBackwardCudaKernel(unittest.TestCase):
             # into each other's .grad
             kx, vx, qy = (t.clone().detach().requires_grad_(True) for t in base)
             out = fn(kx, vx, qy, weights, *pattern, num_heads, npix)
+            # the optimized op also returns the softmax statistics its backward needs;
+            # the reference returns the output alone
+            if isinstance(out, tuple):
+                out = out[0]
             out.backward(dy)
             return kx.grad, vx.grad, qy.grad
 
@@ -880,7 +893,7 @@ class TestRaggedBackwardCudaKernel(unittest.TestCase):
         npix = grid.npoints
         kx, vx, qy = (torch.randn(1, npix, 8, device=self.device, requires_grad=True) for _ in range(3))
 
-        out = _neighborhood_s2_attention_ragged_optimized(
+        out, alpha_sum, qdotk_max = _neighborhood_s2_attention_ragged_optimized(
             kx,
             vx,
             qy,
@@ -892,6 +905,12 @@ class TestRaggedBackwardCudaKernel(unittest.TestCase):
             1,
             npix,
         )
+
+        # the statistics are the backward's own bookkeeping, so nothing must be able to
+        # route a gradient through them -- see _setup_context_attention_ragged_backward
+        self.assertFalse(alpha_sum.requires_grad)
+        self.assertFalse(qdotk_max.requires_grad)
+
         out.backward(torch.ones_like(out))
 
         for name, g in (("dk", kx.grad), ("dv", vx.grad)):

@@ -58,19 +58,50 @@ def parse(log):
     return rows
 
 
+def template_args(name):
+    """The kernel's own top-level template arguments.
+
+    A greedy match on the demangled name picks up the angle brackets in its parameter
+    types as well -- vec_traits<float>::compute_t* among them -- so this walks out from
+    the kernel's own '<' and splits on commas at depth one.
+    """
+    start = name.find("_vec_k<")
+    if start < 0:
+        return []
+    depth, args, cur = 1, [], ""
+    for ch in name[start + len("_vec_k<") :]:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                break
+        if depth == 1 and ch == ",":
+            args.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    args.append(cur.strip())
+    return args
+
+
 def kernel_label(name):
     """Short name plus template arguments, which are what the sweep varies."""
     short = "special" if "ragged_special" in name else "generic" if "ragged_generic" in name else None
     if short is None:
         return None
-    targs = re.search(r"<(.*)>", name)
-    if not targs:
+    args = template_args(name)
+    if not args:
         return short
-    args = [a.strip() for a in targs.group(1).split(",")]
-    # <BDIM_X, BDIM_Y, NLOC, STORAGE_T> for special, <BDIM_X, STORAGE_T> for generic
+
+    # <BDIM_X, BDIM_Y, NLOC, STORAGE_T> for special, <BDIM_X, STORAGE_T> for generic.
+    # The backward carries one more, TWO_PASS, ahead of STORAGE_T in both: it selects
+    # the formulation, and telling the two apart is the point of reading this table.
+    dtype = args[-1].replace("c10::", "")
+    passes = {"true": "2pass", "false": "1pass"}.get(args[-2], "")
     if short == "special" and len(args) >= 4:
-        return f"special  NLOC={args[2]:>2}  {args[3]}"
-    return f"{short}  {args[-1]}"
+        return f"special  NLOC={args[2]:>2}  {dtype:<10} {passes}"
+    return f"{short}  {dtype:<10} {passes}"
 
 
 def main():

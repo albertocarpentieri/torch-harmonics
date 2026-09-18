@@ -58,13 +58,20 @@ namespace attention_kernels
     // Ragged (HEALPix) variant. Same ABI with the two spatial axes collapsed into a
     // flat point axis, and the neighbourhood keyed per output point rather than per
     // output latitude -- see attention_cuda_fwd_ragged.cu.
-    torch::Tensor s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
-                                               at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
-                                               at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
-
-    // Returns (dkx, dvx, dqy) -- see attention_cuda_bwd_ragged.cu.
+    //
+    // Returns (y, alpha_sum, qdotk_max): the softmax statistics are saved per
+    // (batch, head, point) so the backward can walk each neighbourhood once instead of
+    // twice.
     std::tuple<at::Tensor, at::Tensor, at::Tensor>
-    s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor ring_weights,
+    s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
+                                 at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
+                                 at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
+
+    // Takes the forward's three returns alongside dy; returns (dkx, dvx, dqy) -- see
+    // attention_cuda_bwd_ragged.cu.
+    std::tuple<at::Tensor, at::Tensor, at::Tensor>
+    s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor y,
+                                 at::Tensor alpha_sum, at::Tensor qdotk_max, at::Tensor ring_weights,
                                  at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
                                  at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
 

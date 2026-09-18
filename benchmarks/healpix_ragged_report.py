@@ -122,15 +122,21 @@ def layer_pattern_mib(layer: NeighborhoodAttentionS2) -> float:
     return _mib(sum(_nbytes(b) for n, b in layer.named_buffers() if n in _PATTERN_BUFFERS))
 
 
-def pattern_report(nside: int) -> dict:
+def pattern_report(nside: int, cutoff: float | None = None) -> dict:
     """Sizes of the two pattern encodings for one HEALPix grid."""
     grid = HealpixGrid(nside=nside)
     npix = grid.npoints
     nrings = grid.nlat
 
-    # theta_cutoff is left at the module default so these numbers describe what a
-    # layer actually allocates, rather than a radius chosen to flatter the report
-    layer_cutoff = NeighborhoodAttentionS2(in_channels=8, num_heads=1, grid_in=grid, grid_out=grid).theta_cutoff
+    # theta_cutoff defaults to the module's own choice so these numbers describe what
+    # a layer actually allocates, rather than a radius chosen to flatter the report.
+    # An explicit cutoff is honoured so this table describes the same radius the
+    # timing table below is measuring.
+    layer_cutoff = cutoff
+    if layer_cutoff is None:
+        layer_cutoff = NeighborhoodAttentionS2(
+            in_channels=8, num_heads=1, grid_in=grid, grid_out=grid
+        ).theta_cutoff
 
     arcs = precompute_neighborhood_arcs_s2(grid, grid, layer_cutoff)
     col_idx, row_off = precompute_neighborhood_csr_s2(grid, grid, layer_cutoff)
@@ -177,7 +183,17 @@ def _time_ms(fn, iters: int, warmup: int) -> float:
     return start.elapsed_time(end) / iters
 
 
-def timing_report(grid, cutoff: float, batch: int, channels: int, num_heads: int, dtype, iters: int, warmup: int) -> dict:
+def timing_report(
+    grid,
+    cutoff: float,
+    batch: int,
+    channels: int,
+    num_heads: int,
+    dtype,
+    iters: int,
+    warmup: int,
+    skip_reference: bool = False,
+) -> dict:
     """
     Forward and backward, optimized kernel vs torch reference, on one grid.
 
@@ -199,7 +215,11 @@ def timing_report(grid, cutoff: float, batch: int, channels: int, num_heads: int
         "cutoff": cutoff,
     }
 
-    for label, optimized in (("kernel", True), ("reference", False)):
+    arms = (("kernel", True), ("reference", False))
+    if skip_reference:
+        arms = arms[:1]
+
+    for label, optimized in arms:
         layer = NeighborhoodAttentionS2(
             in_channels=channels,
             num_heads=num_heads,
@@ -218,18 +238,36 @@ def timing_report(grid, cutoff: float, batch: int, channels: int, num_heads: int
         # one, which is exactly the input layout each path expects
         x = torch.randn(batch, channels, *grid.spatial_shape, device=device, dtype=dtype, requires_grad=True)
 
+        # Reduced precision is exercised through autocast rather than by casting the
+        # module, for two reasons. The arc kernel reads ring_weights as float32
+        # regardless of the dtype it dispatches on, so a module-wide cast would
+        # reinterpret bf16 bytes as float and time a kernel computing garbage rather
+        # than failing. And autocast is how healda runs bf16, so the projections stay
+        # in float32 masters exactly as they do in training.
+        def autocast():
+            return torch.autocast(
+                device_type="cuda", dtype=dtype, enabled=dtype is not torch.float32
+            )
+
         try:
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             base = torch.cuda.memory_allocated()
 
-            out[f"{label}_fwd_ms"] = _time_ms(lambda: layer(x), iters, warmup)
+            def fwd():
+                with autocast():
+                    layer(x)
 
-            # backward is timed on its own, so the graph is rebuilt untimed each pass
+            out[f"{label}_fwd_ms"] = _time_ms(fwd, iters, warmup)
+
+            # backward is timed on its own, so the graph is rebuilt untimed each pass.
+            # Only the forward is under autocast, matching how a training step nests
+            # them -- the backward inherits the dtypes the forward recorded.
             def bwd():
                 if x.grad is not None:
                     x.grad = None
-                y = layer(x)
+                with autocast():
+                    y = layer(x)
                 y.backward(torch.ones_like(y))
 
             out[f"{label}_bwd_ms"] = _time_ms(bwd, iters, warmup)
@@ -272,6 +310,21 @@ def main():
         action="store_true",
         help="only time HEALPix, dropping the matched product-grid arm and the head-to-head table",
     )
+    parser.add_argument(
+        "--cutoff-deg",
+        type=float,
+        default=None,
+        help="neighbourhood radius in degrees, overriding each grid's default of one grid "
+        "spacing. Neighbours per point grow with the square of this, so a radius several "
+        "times the default is a different regime, not a tweak",
+    )
+    parser.add_argument(
+        "--skip-reference",
+        action="store_true",
+        help="time only the kernel. The torch reference materialises a gather over every "
+        "neighbour column, so at a wide radius it is the arm that runs for tens of minutes "
+        "per iteration or runs out of memory; dropping it keeps a wide-radius sweep feasible",
+    )
     args = parser.parse_args()
 
     print("=" * 108)
@@ -284,7 +337,7 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for nside in args.nsides:
-        r = pattern_report(nside)
+        r = pattern_report(nside, math.radians(args.cutoff_deg) if args.cutoff_deg is not None else None)
         print(
             f"{r['nside']:>6} {r['npix']:>8} {r['nrings']:>6} {r['point_vs_ring_keying']:>8.1f} "
             f"{r['theta_cutoff']:>8.4f} {r['neighbours_per_point']:>8.1f} {r['arcs_per_point']:>8.1f} "
@@ -319,20 +372,36 @@ def main():
             # so the HEALPix arm is the untouched default and the equiangular arm is the
             # one adapted to match it
             hpx = HealpixGrid(nside=nside)
-            cutoff = NeighborhoodAttentionS2(in_channels=8, num_heads=1, grid_in=hpx, grid_out=hpx).theta_cutoff
+            if args.cutoff_deg is not None:
+                cutoff = math.radians(args.cutoff_deg)
+            else:
+                cutoff = NeighborhoodAttentionS2(
+                    in_channels=8, num_heads=1, grid_in=hpx, grid_out=hpx
+                ).theta_cutoff
 
             arms = [hpx] if args.skip_equiangular else [hpx, matched_equiangular(nside)]
             for grid in arms:
                 r = timing_report(
-                    grid, cutoff, args.batch, args.channels, args.num_heads, _DTYPES[dtype_name], args.iters, args.warmup
+                    grid,
+                    cutoff,
+                    args.batch,
+                    args.channels,
+                    args.num_heads,
+                    _DTYPES[dtype_name],
+                    args.iters,
+                    args.warmup,
+                    skip_reference=args.skip_reference,
                 )
                 head_to_head[(dtype_name, nside, r["grid"])] = r
+                nan = float("nan")
                 print(
                     f"{nside:>6} {r['grid']:>12} {r['npoints']:>8} {r['dtype']:>9} "
                     f"{str(r['kernel_selected_optimized']):>5} "
-                    f"{r['kernel_fwd_ms']:>9.3f} {r['reference_fwd_ms']:>9.3f} {r['fwd_speedup']:>7.2f} "
-                    f"{r['kernel_bwd_ms']:>9.3f} {r['reference_bwd_ms']:>9.3f} {r['bwd_speedup']:>7.2f} "
-                    f"{r['kernel_peak_mib']:>9.1f} {r['reference_peak_mib']:>9.1f} {r['kernel_pattern_mib']:>9.2f}"
+                    f"{r['kernel_fwd_ms']:>9.3f} {r.get('reference_fwd_ms', nan):>9.3f} {r['fwd_speedup']:>7.2f} "
+                    f"{r['kernel_bwd_ms']:>9.3f} {r.get('reference_bwd_ms', nan):>9.3f} {r['bwd_speedup']:>7.2f} "
+                    f"{r['kernel_peak_mib']:>9.1f} {r.get('reference_peak_mib', nan):>9.1f} "
+                    f"{r['kernel_pattern_mib']:>9.2f}",
+                    flush=True,
                 )
 
     print()

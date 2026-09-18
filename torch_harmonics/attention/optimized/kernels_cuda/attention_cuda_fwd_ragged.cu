@@ -76,6 +76,16 @@
 // v agree on it; the generic kernel remains for everything else and as an escape
 // hatch, since only the last of NLOC registers is bounds-checked and that argument
 // depends on NLOC being exactly DIV_UP(nchan, BDIM_X).
+//
+// Why the softmax statistics are an output
+// ----------------------------------------
+// Both kernels finish holding alpha_sum and the final qdotk_max for their output
+// point, and both used to throw them away. The backward then had to rebuild them,
+// which took a whole traversal of the neighbourhood -- and a neighbourhood is ~102
+// points, against the one float each statistic costs to store. Saving them is what
+// lets attention_cuda_bwd_ragged.cu walk the arcs once instead of twice; see the
+// identities at the top of that file. Nothing about the forward's own arithmetic
+// changes: the two values are written before alpha_sum is inverted.
 
 #include "attention_cuda.cuh"
 #include <ATen/Dispatch.h>
@@ -148,7 +158,9 @@ namespace attention_kernels
         int64_t npoints_in, int64_t npoints_out, const STORAGE_T *__restrict__ kx,
         const STORAGE_T *__restrict__ vx, const STORAGE_T *__restrict__ qy, const int32_t *__restrict__ seg,
         const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
-        const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y)
+        const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y,
+        float *__restrict__ alpha_sum_out, // [batch][nheads][npoints_out], fp32
+        float *__restrict__ qdotk_max_out) // [batch][nheads][npoints_out], fp32
     {
         using COMPUTE_T = typename vec_traits<STORAGE_T>::compute_t;
 
@@ -240,6 +252,15 @@ namespace attention_kernels
             }
         }
 
+        // Both statistics are warp-uniform, so one lane stores them. They go out before
+        // the reciprocal below, which is the whole of this kernel's contract with the
+        // backward: alpha_sum as accumulated, qdotk_max as the walk left it.
+        if (tidx == 0) {
+            const int64_t istat = int64_t(bh) * npoints_out + ipoint;
+            alpha_sum_out[istat] = alpha_sum;
+            qdotk_max_out[istat] = qdotk_max;
+        }
+
         alpha_sum = 1.0f / alpha_sum;
         for (int chan = tidx; chan < nchan_out; chan += WARP_SIZE) { vstore(y, chan, __vscale(alpha_sum, shy[chan])); }
 
@@ -264,7 +285,9 @@ namespace attention_kernels
         int64_t npoints_in, int64_t npoints_out, const STORAGE_T *__restrict__ kx,
         const STORAGE_T *__restrict__ vx, const STORAGE_T *__restrict__ qy, const int32_t *__restrict__ seg,
         const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
-        const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y)
+        const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y,
+        float *__restrict__ alpha_sum_out, // [batch][nheads][npoints_out], fp32
+        float *__restrict__ qdotk_max_out) // [batch][nheads][npoints_out], fp32
     {
         using COMPUTE_T = typename vec_traits<STORAGE_T>::compute_t;
 
@@ -436,6 +459,13 @@ namespace attention_kernels
             }
         }
 
+        // see the generic kernel: written as accumulated, before the reciprocal
+        if (tidx == 0) {
+            const int64_t istat = int64_t(bh) * npoints_out + ipoint;
+            alpha_sum_out[istat] = alpha_sum;
+            qdotk_max_out[istat] = qdotk_max;
+        }
+
         const float alpha_inv = 1.0f / alpha_sum;
 #pragma unroll
         for (int i = 0; i < NLOC_M1; i++) { vstore(y, i * BDIM_X, __vscale(alpha_inv, locy[i])); }
@@ -454,7 +484,8 @@ namespace attention_kernels
                                            const STORAGE_T *__restrict__ _vxp, const STORAGE_T *__restrict__ _qyp,
                                            const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
                                            const int64_t *_ring_size, const float *_ring_weights,
-                                           STORAGE_T *__restrict__ _yp, cudaStream_t stream)
+                                           STORAGE_T *__restrict__ _yp, float *_alpha_sum, float *_qdotk_max,
+                                           cudaStream_t stream)
     {
         if constexpr (CUR_LOC > MAX_LOC) {
             TORCH_CHECK(false, "ragged special attention kernel reached nloc ", nloc, " above its bound ", MAX_LOC);
@@ -469,13 +500,13 @@ namespace attention_kernels
 
                 s2_attn_fwd_ragged_special_vec_k<BDIM_X, BDIM_Y, CUR_LOC><<<grid, block, shsize, stream>>>(
                     nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg, _seg_off,
-                    _ring_base, _ring_size, _ring_weights, _yp);
+                    _ring_base, _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max);
                 CHECK_ERROR("s2_attn_fwd_ragged_special_vec_k");
                 return;
             }
             launch_spc_attn_fwd_ragged<BDIM_X, BDIM_Y, CUR_LOC + 1, MAX_LOC, STORAGE_T>(
                 nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg,
-                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, stream);
+                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max, stream);
         }
     }
 
@@ -497,7 +528,8 @@ namespace attention_kernels
                                            const STORAGE_T *__restrict__ _vxp, const STORAGE_T *__restrict__ _qyp,
                                            const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
                                            const int64_t *_ring_size, const float *_ring_weights,
-                                           STORAGE_T *__restrict__ _yp, cudaStream_t stream)
+                                           STORAGE_T *__restrict__ _yp, float *_alpha_sum, float *_qdotk_max,
+                                           cudaStream_t stream)
     {
         // The register-blocked kernel needs NLOC == DIV_UP(nchan, WARP_SIZE) to hold for
         // both channel counts at once, which is why the equality is required rather
@@ -506,7 +538,7 @@ namespace attention_kernels
         if (!ragged_force_generic() && nchans_in == nchans_out && nloc <= MAX_LOCAL_ARR_LEN_RAGGED) {
             launch_spc_attn_fwd_ragged<WARP_SIZE, THREADS / WARP_SIZE, 1, MAX_LOCAL_ARR_LEN_RAGGED, STORAGE_T>(
                 nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg,
-                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, stream);
+                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max, stream);
             return;
         }
 
@@ -520,7 +552,7 @@ namespace attention_kernels
 
         s2_attn_fwd_ragged_generic_vec_k<THREADS><<<grid, block, shsize, stream>>>(
             nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg, _seg_off, _ring_base,
-            _ring_size, _ring_weights, _yp);
+            _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max);
         CHECK_ERROR("s2_attn_fwd_ragged_generic_vec_k");
 
         return;
@@ -532,9 +564,15 @@ namespace attention_kernels
     // construction (see attention/_layout.py). Heads stay packed along the channel
     // dimension for the same reason as on the product grids: folding them into the
     // batch dimension is not free in a channel-innermost layout.
-    torch::Tensor s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
-                                               at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
-                                               at::Tensor ring_size, int64_t num_heads, int64_t npoints_out)
+    //
+    // Returns (y, alpha_sum, qdotk_max). The two statistics are per (batch, head,
+    // point) and fp32 whatever the activations are, for the same reason ring_weights
+    // is: they are softmax bookkeeping, not activations, and the backward reads them
+    // as float unconditionally.
+    std::tuple<at::Tensor, at::Tensor, at::Tensor>
+    s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
+                                 at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
+                                 at::Tensor ring_size, int64_t num_heads, int64_t npoints_out)
     {
         CHECK_CUDA_INPUT_TENSOR(kx);
         CHECK_CUDA_INPUT_TENSOR(vx);
@@ -591,6 +629,14 @@ namespace attention_kernels
         const int64_t out_dims[] = {batch_size, npoints_out, int64_t(nchans_out) * num_heads};
         torch::Tensor y;
 
+        // One entry per (batch, head, point), which is the kernel's own indexing: a warp
+        // owns one output point and blockIdx.y is batch * nheads + head. empty(), not
+        // zeros(): every entry is written by the warp that owns it, and the grid covers
+        // every (batch, head, point) triple.
+        const int64_t stat_dims[] = {batch_size, num_heads, npoints_out};
+        torch::Tensor alpha_sum = torch::empty(stat_dims, kx.options().dtype(torch::kFloat32));
+        torch::Tensor qdotk_max = torch::empty(stat_dims, kx.options().dtype(torch::kFloat32));
+
         // Activations stay in their native dtype and y is allocated in it, so there is
         // no whole-tensor fp32 copy and the read bandwidth for fp16/bf16 is halved.
         // The kernel widens to fp32 at load and narrows back at store; compute and
@@ -610,7 +656,9 @@ namespace attention_kernels
                 reinterpret_cast<const int64_t *>(ring_base.data_ptr()),
                 reinterpret_cast<const int64_t *>(ring_size.data_ptr()),
                 reinterpret_cast<const float *>(ring_weights.data_ptr()),
-                reinterpret_cast<storage_t *>(y_nhwc.data_ptr()), stream);
+                reinterpret_cast<storage_t *>(y_nhwc.data_ptr()),
+                reinterpret_cast<float *>(alpha_sum.data_ptr()),
+                reinterpret_cast<float *>(qdotk_max.data_ptr()), stream);
 
             y = y_nhwc;
         });
@@ -619,7 +667,7 @@ namespace attention_kernels
 
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        return y;
+        return std::make_tuple(y, alpha_sum, qdotk_max);
     }
 
     TORCH_LIBRARY_IMPL(attention_kernels, CUDA, m) { m.impl("forward_ragged", &s2_attention_fwd_ragged_cuda); }

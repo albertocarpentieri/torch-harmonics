@@ -49,14 +49,45 @@
 // port, not a redesign: no transposed (input-keyed) pattern is built, and no second
 // precompute is needed.
 //
-// Two passes over the same arcs
-// -----------------------------
-// Pass 1 accumulates the running-softmax statistics (alpha_sum, qdotk_max, the two
-// per-channel reductions and the scalar alpha_vw_) and writes dqy. Pass 2 replays the arcs with the final
-// qdotk_max to scatter dk/dv. The replay is what avoids materialising the per-
-// neighbour alphas, which on a HEALPix neighbourhood would be a far larger array
-// than on a product grid, since the pattern here is npoints_out/nlat_out ~ 3*nside
-// times bigger. Recomputing q.k is cheaper than storing it.
+// One pass over the arcs
+// ----------------------
+// This kernel used to walk each neighbourhood twice. Pass 1 accumulated the running-
+// softmax statistics (alpha_sum, qdotk_max, the two per-channel reductions and the
+// scalar alpha_vw_) and wrote dqy; pass 2 replayed the arcs against the final
+// qdotk_max to scatter dk/dv. The replay is what avoided materialising the per-
+// neighbour alphas, which on a HEALPix neighbourhood would be a far larger array than
+// on a product grid, since the pattern here is npoints_out/nlat_out ~ 3*nside times
+// bigger -- recomputing q.k is cheaper than storing it.
+//
+// Both walks are now one, on three identities. Writing p_i = alpha_i / alpha_sum for
+// the softmax weight of neighbour i, gdotv_i = dy . v_i, and out for the forward
+// output at this point:
+//
+//   (1)  integral = sum_i p_i gdotv_i = dy . out,
+//
+//        since out = sum_i p_i v_i. So the quantity pass 1 spent a traversal on costs
+//        O(nchan) given the forward output, which is FlashAttention's D = rowsum(dO*O)
+//        and is formed in torch before the launch.
+//
+//   (2)  dqy = (alpha_sum * loc_kvw - alpha_vw_ * loc_k__) / alpha_sum^2
+//            = sum_i p_i (gdotv_i - integral) k_i,
+//
+//        by substituting loc_kvw = sum_i alpha_i gdotv_i k_i, loc_k__ = sum_i alpha_i
+//        k_i and alpha_vw_ = integral * alpha_sum. So dqy is a plain accumulation over
+//        neighbours once integral is known up front, rather than three reductions
+//        combined after the fact.
+//
+//   (3)  the scatter's own multipliers are (gdotv_i - integral) * p_i for dk and p_i
+//        for dv -- the same two numbers (2) needs.
+//
+// So given qdotk_max, alpha_sum and integral before the walk begins, dqy and the
+// dk/dv scatter are functions of identical per-neighbour quantities and belong in one
+// traversal. The first two come from the forward, which held both and threw them away
+// (see attention_cuda_fwd_ragged.cu); the third comes from (1).
+//
+// The identities are exact, so the only thing that changes is which fp32 sums happen
+// in which order, and gradients differ in their last bits. TORCH_HARMONICS_RAGGED_BWD_
+// TWO_PASS=1 restores the two-pass formulation for exactly that reason.
 //
 // Both variants of the product-grid file are now provided, for the reason the
 // forward gave: the generic kernel keeps one neighbour in flight at a time and
@@ -94,18 +125,19 @@
 #include "attention_cuda_utils.cuh"
 
 // Threads per block, and so warps per block, since BDIM_X is a warp. Overridable for
-// the reason given in attention_cuda_fwd_ragged.cu, and more so here: warps in a
-// block take consecutive output points, adjacent points share 74% of their
-// neighbours by measurement, and the backward walks each neighbourhood twice, so it
-// has twice as much to gain from L1 holding that overlap. Kept separate from the
-// forward's knob because the two kernels have different register pressure.
+// the reason given in attention_cuda_fwd_ragged.cu: warps in a block take consecutive
+// output points and adjacent points share 74% of their neighbours by measurement, so a
+// wider block turns L1 into a shared cache for that overlap. The backward used to have
+// twice as much to gain from it, since it walked each neighbourhood twice; that half of
+// the argument is gone. Kept separate from the forward's knob because the two kernels
+// have different register pressure.
 #ifndef TH_ATTENTION_RAGGED_BWD_THREADS
 #define TH_ATTENTION_RAGGED_BWD_THREADS (64)
 #endif
 #define THREADS (TH_ATTENTION_RAGGED_BWD_THREADS)
 
-// Neighbours per group in the special kernel's two arc walks, the backward's
-// counterpart of TH_ATTENTION_RAGGED_NB.
+// Neighbours per group in the special kernel's arc walk, the backward's counterpart of
+// TH_ATTENTION_RAGGED_NB.
 //
 // Neither the product-grid backward nor the first ragged port grouped at all, so
 // both walked one neighbour at a time: address, load k and v, two warp reductions,
@@ -115,31 +147,37 @@
 //
 // Setting this to 1 recovers the ungrouped kernel exactly, which is the escape
 // hatch if the grouped arithmetic ever looks suspect; TORCH_HARMONICS_RAGGED_BWD_
-// GENERIC=1 remains the coarser one.
+// TWO_PASS=1 and TORCH_HARMONICS_RAGGED_BWD_GENERIC=1 are the coarser ones, and
+// unlike this constant they need no rebuild.
 //
-// Unlike the forward, the choice here is a real trade rather than a free lunch.
+// Unlike the forward, the choice here is a real trade rather than a free lunch, and
+// collapsing the two walks into one made it a sharper one: the single-pass body holds
+// the reductions, dqy's accumulator and the scatter's addresses at the same time, where
+// the two-pass kernel spread them over two loops whose register peaks did not overlap.
 // For nchan 96 (NLOC 3), fp32, sm_100a:
 //
-//   NB   registers   spill   warps/SM
-//    1       56        0        36
-//    2       64        0        32
-//    4       72        0        28
+//   NB   single pass                two pass
+//        registers spill warps/SM   registers spill warps/SM
+//    1       56       0      36        56        0      36
+//    2       72       0      28        64        0      32
+//    4       96       0      21        72        0      28
 //
-// The forward got NB 4 for the same register count as NB 2, so nothing was given
-// up. This kernel already holds four register accumulators per lane before any
-// grouping, so every doubling costs 8 registers and about four resident warps:
-// NB 4 buys four times the loads in flight at 44% occupancy instead of 56%.
-// Nothing spills, which was the thing that would have made it pointless.
+// So a doubling costs the single-pass kernel about 20 registers against the two-pass
+// kernel's 8, and NB 4 runs at 33% occupancy rather than 44%. Nothing spills at the
+// real workload either way, which is the thing that would have made grouping
+// pointless; the instantiations that do spill are all double above NLOC 14.
 //
-// 4 is the default on the usual argument that memory-level parallelism per thread
-// beats occupancy for a latency-bound kernel, but that is a prediction, not a
-// measurement, and it is the one number here a GPU still has to settle. Sweeping
-// needs no source edit:
+// 4 stays the default on the usual argument that memory-level parallelism per thread
+// beats occupancy for a latency-bound kernel, and the single pass halves the traversals
+// that latency is spent on before NB is considered at all. But that argument is now
+// carrying more weight than it was asked to, and it remains a prediction: NB is the one
+// number here a GPU still has to settle, more so than before. Sweeping needs no source
+// edit:
 //
 //   NVCC_APPEND_FLAGS="-DTH_ATTENTION_RAGGED_BWD_NB=2" python setup.py build_ext --inplace
 //
-// NB 1 measuring 56 registers, exactly what the kernel used before grouping, is
-// the check that the escape hatch really is the old code.
+// Both formulations measuring 56 registers at NB 1, which is what the kernel used
+// before grouping, is the check that the escape hatch really is the old code.
 #ifndef TH_ATTENTION_RAGGED_BWD_NB
 #define TH_ATTENTION_RAGGED_BWD_NB (4)
 #endif
@@ -148,18 +186,10 @@
 // one accumulator. 16 matches MAX_LOCAL_ARR_LEN in attention_cuda_bwd.cu, so with a
 // 32-lane BDIM_X it covers up to 512 channels per head; HEALDA's dit-5B runs 96.
 //
-// The kernel holds four accumulators of that length, so it is the register-hungry
-// half of the pair, and occupancy here is register-limited. ptxas -v for the real
-// workload, nchan 96 (NLOC 3): 56 registers, no spill, 36 warps/SM on both sm_90a
-// and sm_100a, which is the same register count the generic kernel needs while doing
-// strictly less work per neighbour. The one instantiation that spills is nchan 64 in
-// fp32 on sm_90a, by 8 bytes, where ptxas prefers 48 registers and 42 warps/SM to 56
-// and 36. See benchmarks/ptxas_register_report.py.
-//
-// There is deliberately no neighbours-per-group constant to go with it, as there is
-// in the forward: grouping would move the online softmax's rescale from per
-// neighbour to per group, and that changes the arithmetic of a gradient, so it is a
-// change to make against a numerical check rather than alongside a port.
+// Single pass holds three accumulators of that length, two-pass four, so this is the
+// register-hungry half of the pair either way and occupancy here is register-limited.
+// See benchmarks/ptxas_register_report.py for the table, and the commentary on
+// TH_ATTENTION_RAGGED_BWD_NB above for what it says.
 #define MAX_LOCAL_ARR_LEN_RAGGED_BWD (16)
 
 namespace attention_kernels
@@ -170,7 +200,13 @@ namespace attention_kernels
     // the type of the gradient OUTPUTS dkx/dvx/dqy. The gradients stay fp32 because
     // dkx/dvx are atomically scatter-accumulated and reduced-precision atomics would
     // lose precision; the wrapper narrows them back at the end.
-    template <int BDIM_X, typename STORAGE_T>
+    //
+    // TWO_PASS selects the formulation, not a different result: false walks each arc
+    // once on the identities at the top of the file, true restores the two walks it
+    // replaced. It has to be a template parameter rather than a flag because it decides
+    // which accumulators exist and how much shared memory a warp needs, so both are
+    // compiled and the launcher picks one -- see ragged_bwd_two_pass().
+    template <int BDIM_X, bool TWO_PASS, typename STORAGE_T>
     __global__ __launch_bounds__(BDIM_X) void s2_attn_bwd_ragged_generic_vec_k(
         int nheads,     // no. of attention heads packed along the channel dim
         int nchans_in,  // no. of STORAGE_T elements along channel dim, per head
@@ -180,6 +216,12 @@ namespace attention_kernels
         const STORAGE_T *__restrict__ vx, // [batch][npoints_in][nheads * nchan_out]
         const STORAGE_T *__restrict__ qy, // [batch][npoints_out][nheads * nchan_in]
         const STORAGE_T *__restrict__ dy, // [batch][npoints_out][nheads * nchan_out]
+        // The forward's softmax statistics and integral = dy . out, all per
+        // (batch, head, point) and fp32. Read only when TWO_PASS is false, which is
+        // the point of them: they are what the first walk used to produce.
+        const float *__restrict__ alpha_sum_fwd, // [batch][nheads][npoints_out]
+        const float *__restrict__ qdotk_max_fwd, // [batch][nheads][npoints_out]
+        const float *__restrict__ integral_fwd,  // [batch][nheads][npoints_out]
         const int32_t *__restrict__ seg, const int32_t *__restrict__ seg_off,
         const int64_t *__restrict__ ring_base, const int64_t *__restrict__ ring_size,
         const float *__restrict__ ring_weights,
@@ -191,21 +233,28 @@ namespace attention_kernels
 
         extern __shared__ __align__(sizeof(float4)) float shext[];
 
-        // Four per-warp arrays: 3 * nchans_in + nchans_out.
+        // Per-warp arrays: NACC accumulators for dqy of nchans_in entries each, then dy
+        // and qy. So (NACC + 1) * nchans_in + nchans_out.
         //
-        // The product-grid kernels carry a fifth, alpha_vw_, one entry per channel.
-        // Its recurrence is alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv and
-        // both of those are warp-uniform scalars, so every entry holds the same
-        // number and always has: it is a scalar accumulator stored nchans_in times.
-        // It is only ever consumed as a multiplier of sh_alpha_k__ when dqy is
-        // written, so a single register does the same work. Dropping it removes a
-        // third of pass 1's shared-memory read-modify-writes and a quarter of the
-        // per-warp footprint. (attention_cuda_bwd.cu replicates it in both its
-        // generic and its register-blocked kernel; the redundancy is not ragged's.)
-        COMPUTE_T *sh_alpha_k__ = reinterpret_cast<COMPUTE_T *>(shext) + threadIdx.y * (nchans_in * 3 + nchans_out);
-        COMPUTE_T *sh_alpha_kvw = sh_alpha_k__ + nchans_in;
+        // The two-pass formulation needs two accumulators, sum_i alpha_i k_i and
+        // sum_i alpha_i gdotv_i k_i, and combines them once the statistics are final.
+        // Identity (2) at the top of the file says that combination is
+        // sum_i p_i (gdotv_i - integral) k_i, which a single pass accumulates directly,
+        // so it needs one.
+        //
+        // The product-grid kernels carry a further array, alpha_vw_, one entry per
+        // channel. Its recurrence is alpha_vw_ = alpha_vw_ * max_correction +
+        // ainz_gdotv and both of those are warp-uniform scalars, so every entry holds
+        // the same number and always has: it is a scalar accumulator stored nchans_in
+        // times, and 6253cae made it a register. Identity (2) removes it outright --
+        // alpha_vw_ is integral * alpha_sum, so with integral known up front there is
+        // nothing left for it to carry. (attention_cuda_bwd.cu replicates it in both
+        // its generic and its register-blocked kernel; the redundancy is not ragged's.)
+        constexpr int NACC = TWO_PASS ? 2 : 1;
 
-        COMPUTE_T *sh_dy = sh_alpha_kvw + nchans_in;
+        COMPUTE_T *sh_acc = reinterpret_cast<COMPUTE_T *>(shext) + threadIdx.y * (nchans_in * (NACC + 1) + nchans_out);
+
+        COMPUTE_T *sh_dy = sh_acc + nchans_in * NACC;
         COMPUTE_T *sh_qy = sh_dy + nchans_out;
 
         const int bh = blockIdx.y;
@@ -240,12 +289,8 @@ namespace attention_kernels
         dqy += int64_t(batch) * npoints_out * ldi + int64_t(head) * nchans_in + ipoint * ldi;
 
         // zero/init shared memory
-        for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
-            sh_alpha_k__[chan] = __vset<COMPUTE_T>(0.0f);
-            sh_alpha_kvw[chan] = __vset<COMPUTE_T>(0.0f);
-
-            sh_qy[chan] = vload(qy, chan);
-        }
+        for (int chan = tidx; chan < nchans_in * NACC; chan += WARP_SIZE) { sh_acc[chan] = __vset<COMPUTE_T>(0.0f); }
+        for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) { sh_qy[chan] = vload(qy, chan); }
         for (int chan = tidx; chan < nchans_out; chan += WARP_SIZE) { sh_dy[chan] = vload(dy, chan); }
 
 #if __CUDA_ARCH__ < 900
@@ -256,98 +301,119 @@ namespace attention_kernels
         if constexpr (std::is_same<COMPUTE_T, float4>::value) { __syncwarp(); }
 #endif
 
-        // for dkx, dvx, dqy
-        float alpha_sum = 0.0f;
+        // The three warp-uniform scalars the walk below needs, however they are come by:
+        // the final running maximum, the softmax normaliser and integral =
+        // sum_i p_i gdotv_i.
         float qdotk_max = -FLT_MAX;
-
-        // for dkx
+        float alpha_sum_inv;
         float integral = 0.0f;
-
-        // the scalar that replaces the replicated sh_alpha_vw_ array
-        float alpha_vw_ = 0.0f;
 
         const int seg_beg = seg_off[ipoint];
         const int seg_end = seg_off[ipoint + 1];
 
-        // Pass 1: accumulate alpha_sum, integral and the shared reductions, along
-        // with a progressively computed qdotk_max.
-        for (int sg = seg_beg; sg < seg_end; sg++) {
+        if constexpr (TWO_PASS) {
 
-            const int iring = seg[3 * sg + 0];
-            const int seg_lo = seg[3 * sg + 1];
-            const int seg_len = seg[3 * sg + 2];
+            COMPUTE_T *sh_alpha_k__ = sh_acc;
+            COMPUTE_T *sh_alpha_kvw = sh_acc + nchans_in;
 
-            // constant along the arc: every point of a ring carries the same
-            // quadrature weight
-            const float qw_seg = ring_weights[iring];
+            float alpha_sum = 0.0f;
 
-            // a ring is contiguous in RING order, so the flat column is the ring's
-            // base plus an offset that counts up and wraps at the ring's end
-            const int64_t ring_lo = ring_base[iring];
-            const int64_t ring_hi = ring_lo + ring_size[iring];
+            // the scalar that replaces the replicated sh_alpha_vw_ array
+            float alpha_vw_ = 0.0f;
 
-            int64_t col = ring_lo + seg_lo;
+            // Pass 1: accumulate alpha_sum, integral and the shared reductions, along
+            // with a progressively computed qdotk_max.
+            for (int sg = seg_beg; sg < seg_end; sg++) {
 
-            for (int j = 0; j < seg_len; j++) {
+                const int iring = seg[3 * sg + 0];
+                const int seg_lo = seg[3 * sg + 1];
+                const int seg_len = seg[3 * sg + 2];
 
-                const STORAGE_T *_kx = kx + col * ldi;
-                const STORAGE_T *_vx = vx + col * ldo;
+                // constant along the arc: every point of a ring carries the same
+                // quadrature weight
+                const float qw_seg = ring_weights[iring];
 
-                COMPUTE_T qdotk_v = __vset<COMPUTE_T>(0.0f);
-                COMPUTE_T gdotv_v = __vset<COMPUTE_T>(0.0f);
+                // a ring is contiguous in RING order, so the flat column is the ring's
+                // base plus an offset that counts up and wraps at the ring's end
+                const int64_t ring_lo = ring_base[iring];
+                const int64_t ring_hi = ring_lo + ring_size[iring];
 
-                for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
-                    qdotk_v = __vadd(qdotk_v, __vmul(sh_qy[chan], vload(_kx, chan)));
+                int64_t col = ring_lo + seg_lo;
+
+                for (int j = 0; j < seg_len; j++) {
+
+                    const STORAGE_T *_kx = kx + col * ldi;
+                    const STORAGE_T *_vx = vx + col * ldo;
+
+                    COMPUTE_T qdotk_v = __vset<COMPUTE_T>(0.0f);
+                    COMPUTE_T gdotv_v = __vset<COMPUTE_T>(0.0f);
+
+                    for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
+                        qdotk_v = __vadd(qdotk_v, __vmul(sh_qy[chan], vload(_kx, chan)));
+                    }
+                    for (int chan = tidx; chan < nchans_out; chan += WARP_SIZE) {
+                        gdotv_v = __vadd(gdotv_v, __vmul(sh_dy[chan], vload(_vx, chan)));
+                    }
+
+                    const float qdotk = __warp_sum(__vred(qdotk_v));
+                    const float gdotv = __warp_sum(__vred(gdotv_v));
+
+                    const float qdotk_max_tmp = max(qdotk_max, qdotk);
+                    const float alpha_inz = expf(qdotk - qdotk_max_tmp) * qw_seg;
+                    const float max_correction = expf(qdotk_max - qdotk_max_tmp);
+                    alpha_sum = alpha_sum * max_correction + alpha_inz;
+
+                    integral = integral * max_correction + alpha_inz * gdotv;
+
+                    const float ainz_gdotv = alpha_inz * gdotv;
+
+                    // same recurrence the per-channel array used to run, once
+                    alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv;
+
+                    for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
+
+                        const COMPUTE_T kxval = vload(_kx, chan);
+
+                        sh_alpha_k__[chan]
+                            = __vadd(__vscale(max_correction, sh_alpha_k__[chan]), __vscale(alpha_inz, kxval));
+                        sh_alpha_kvw[chan]
+                            = __vadd(__vscale(max_correction, sh_alpha_kvw[chan]), __vscale(ainz_gdotv, kxval));
+                    }
+                    qdotk_max = qdotk_max_tmp;
+
+                    // next point in the arc; wraps at most once
+                    if (++col == ring_hi) { col = ring_lo; }
                 }
-                for (int chan = tidx; chan < nchans_out; chan += WARP_SIZE) {
-                    gdotv_v = __vadd(gdotv_v, __vmul(sh_dy[chan], vload(_vx, chan)));
-                }
-
-                const float qdotk = __warp_sum(__vred(qdotk_v));
-                const float gdotv = __warp_sum(__vred(gdotv_v));
-
-                const float qdotk_max_tmp = max(qdotk_max, qdotk);
-                const float alpha_inz = expf(qdotk - qdotk_max_tmp) * qw_seg;
-                const float max_correction = expf(qdotk_max - qdotk_max_tmp);
-                alpha_sum = alpha_sum * max_correction + alpha_inz;
-
-                integral = integral * max_correction + alpha_inz * gdotv;
-
-                const float ainz_gdotv = alpha_inz * gdotv;
-
-                // same recurrence the per-channel array used to run, once
-                alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv;
-
-                for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
-
-                    const COMPUTE_T kxval = vload(_kx, chan);
-
-                    sh_alpha_k__[chan] = __vadd(__vscale(max_correction, sh_alpha_k__[chan]), __vscale(alpha_inz, kxval));
-                    sh_alpha_kvw[chan]
-                        = __vadd(__vscale(max_correction, sh_alpha_kvw[chan]), __vscale(ainz_gdotv, kxval));
-                }
-                qdotk_max = qdotk_max_tmp;
-
-                // next point in the arc; wraps at most once
-                if (++col == ring_hi) { col = ring_lo; }
             }
+
+            alpha_sum_inv = 1.0f / alpha_sum;
+
+            integral *= alpha_sum_inv;
+
+            // Write dqy (fp32 output)
+            for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
+
+                // __vscale by the scalar, where this used to __vmul by a vector every
+                // entry of which held that scalar
+                dqy[chan] = __vscale(
+                    alpha_sum_inv * alpha_sum_inv,
+                    __vsub(__vscale(alpha_sum, sh_alpha_kvw[chan]), __vscale(alpha_vw_, sh_alpha_k__[chan])));
+            }
+
+        } else {
+
+            const int64_t istat = int64_t(bh) * npoints_out + ipoint;
+
+            qdotk_max = qdotk_max_fwd[istat];
+            integral = integral_fwd[istat];
+            alpha_sum_inv = 1.0f / alpha_sum_fwd[istat];
         }
 
-        const float alpha_sum_inv = 1.0f / alpha_sum;
-
-        integral *= alpha_sum_inv;
-
-        // Write dqy (fp32 output)
-        for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
-
-            // __vscale by the scalar, where this used to __vmul by a vector every
-            // entry of which held that scalar
-            dqy[chan] = __vscale(
-                alpha_sum_inv * alpha_sum_inv,
-                __vsub(__vscale(alpha_sum, sh_alpha_kvw[chan]), __vscale(alpha_vw_, sh_alpha_k__[chan])));
-        }
-
-        // Pass 2: replay the arcs with the final qdotk_max to scatter dk/dv.
+        // The walk. Under TWO_PASS it is the replay of arcs pass 1 has already been
+        // over, and dqy is already written, so it only scatters. Otherwise it is the
+        // whole backward: identity (3) says the scatter's multipliers are
+        // (gdotv_i - integral) * p_i and p_i, and identity (2) says dqy accumulates the
+        // first of those times k_i, so one traversal serves all three gradients.
         for (int sg = seg_beg; sg < seg_end; sg++) {
 
             const int iring = seg[3 * sg + 0];
@@ -391,6 +457,14 @@ namespace attention_kernels
                 const float scale_fact_qy = (gdotv - integral) * alpha_mul;
                 const float scale_fact_dy = alpha_mul;
 
+                // dqy by identity (2), in the same traversal: scale_fact_qy is already
+                // p_i (gdotv_i - integral), which is exactly the weight k_i carries.
+                if constexpr (!TWO_PASS) {
+                    for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) {
+                        sh_acc[chan] = __vadd(sh_acc[chan], __vscale(scale_fact_qy, vload(_kx, chan)));
+                    }
+                }
+
                 // float4, 128-bit atomics are only supported by devices of compute
                 // capability 9.x+, so on older devices we resort to 32-bit atomics
 
@@ -425,6 +499,12 @@ namespace attention_kernels
             }
         }
 
+        // Write dqy (fp32 output). No reciprocal and no combination: alpha_sum_inv went
+        // into every term as it was accumulated.
+        if constexpr (!TWO_PASS) {
+            for (int chan = tidx; chan < nchans_in; chan += WARP_SIZE) { dqy[chan] = sh_acc[chan]; }
+        }
+
         return;
     }
 
@@ -443,16 +523,21 @@ namespace attention_kernels
     // between taking the dy side through the same unrolled loops as the qy side or
     // through a runtime-bounded loop over shared memory, and only the former is
     // reachable once the channel counts are required to agree.
-    template <int BDIM_X, int BDIM_Y, int NLOC, typename STORAGE_T>
+    //
+    // TWO_PASS carries the same meaning as in the generic kernel above.
+    template <int BDIM_X, int BDIM_Y, int NLOC, bool TWO_PASS, typename STORAGE_T>
     __global__ __launch_bounds__(BDIM_X *BDIM_Y) void s2_attn_bwd_ragged_special_vec_k(
         int nheads,    // no. of attention heads packed along the channel dim
         int nchan_in,  // no. of STORAGE_T elements along channel dim, per head
         int nchan_out, // no. of STORAGE_T elements along channel dim, per head
         int64_t npoints_in, int64_t npoints_out,
-        const STORAGE_T *__restrict__ kx, // [batch][npoints_in][nheads * nchan_in]
-        const STORAGE_T *__restrict__ vx, // [batch][npoints_in][nheads * nchan_out]
-        const STORAGE_T *__restrict__ qy, // [batch][npoints_out][nheads * nchan_in]
-        const STORAGE_T *__restrict__ dy, // [batch][npoints_out][nheads * nchan_out]
+        const STORAGE_T *__restrict__ kx,        // [batch][npoints_in][nheads * nchan_in]
+        const STORAGE_T *__restrict__ vx,        // [batch][npoints_in][nheads * nchan_out]
+        const STORAGE_T *__restrict__ qy,        // [batch][npoints_out][nheads * nchan_in]
+        const STORAGE_T *__restrict__ dy,        // [batch][npoints_out][nheads * nchan_out]
+        const float *__restrict__ alpha_sum_fwd, // [batch][nheads][npoints_out]
+        const float *__restrict__ qdotk_max_fwd, // [batch][nheads][npoints_out]
+        const float *__restrict__ integral_fwd,  // [batch][nheads][npoints_out]
         const int32_t *__restrict__ seg, const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
         const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights,
         typename vec_traits<STORAGE_T>::compute_t *__restrict__ dkx, // [batch][npoints_in][nheads * nchan_in]
@@ -484,23 +569,24 @@ namespace attention_kernels
         extern __shared__ __align__(sizeof(float4)) float shext[];
 
         // sh_dy[nchan_out], sh_qy[nchan_in]. Two arrays per warp where the generic
-        // kernel needs four: the per-channel reductions are in registers now, and
-        // these two survive only because the pre-9.0 epilogue undoes the tidx offset
+        // kernel needs three or four: the per-channel reductions are in registers now,
+        // and these two survive only because the pre-9.0 epilogue undoes the tidx offset
         // and reads them as individual floats, which registers cannot serve.
         COMPUTE_T *sh_dy = reinterpret_cast<COMPUTE_T *>(shext) + threadIdx.y * (nchan_in + nchan_out) + tidx;
         COMPUTE_T *sh_qy = sh_dy + nchan_out;
 
-        // for dqy. The product grid carries a third array, loc_vw_[NLOC], every entry
-        // of which always holds the same number; it is a scalar here for the reason
-        // spelled out in the generic kernel above.
-        COMPUTE_T loc_k__[NLOC];
-        COMPUTE_T loc_kvw[NLOC];
+        // dqy, accumulated in place by identity (2): sum_i p_i (gdotv_i - integral) k_i,
+        // which is what the two-pass formulation assembles at the end of its first walk
+        // out of two accumulators and a scalar. Dead under TWO_PASS, which declares its
+        // own pair below.
+        COMPUTE_T loc_dq[NLOC];
+#pragma unroll
+        for (int i = 0; i < NLOC; i++) { loc_dq[i] = __vset<COMPUTE_T>(0.0f); }
 
         // Register copies of this thread's slice of qy / dy. Both are loop-invariant
         // across neighbours, and each thread only ever touches its own
         // (tidx + i*BDIM_X) slots, so re-reading them from shared once per neighbour
-        // was pure overhead -- and this kernel reads them twice per neighbour, once in
-        // each pass.
+        // was pure overhead.
         COMPUTE_T loc_qy[NLOC];
         COMPUTE_T loc_dy[NLOC];
 #pragma unroll
@@ -520,12 +606,6 @@ namespace attention_kernels
         dkx += int64_t(batch) * npoints_in * ldi + int64_t(head) * nchan_in + tidx;
         dvx += int64_t(batch) * npoints_in * ldo + int64_t(head) * nchan_out + tidx;
         dqy += int64_t(batch) * npoints_out * ldi + int64_t(head) * nchan_in + ipoint * ldi + tidx;
-
-#pragma unroll
-        for (int i = 0; i < NLOC; i++) {
-            loc_k__[i] = __vset<COMPUTE_T>(0.0f);
-            loc_kvw[i] = __vset<COMPUTE_T>(0.0f);
-        }
 
 #pragma unroll
         for (int i = 0; i < NLOC_M1; i++) {
@@ -555,233 +635,259 @@ namespace attention_kernels
         if constexpr (std::is_same<COMPUTE_T, float4>::value) { __syncwarp(); }
 #endif
 
-        // for dkx, dvx, dqy
-        float alpha_sum = 0.0f;
+        // The three warp-uniform scalars the walk below needs; see the generic kernel.
         float qdotk_max = -FLT_MAX;
-
-        // for dkx
+        float alpha_sum_inv;
         float integral = 0.0f;
-
-        // the scalar that replaces the replicated loc_vw_ array
-        float alpha_vw_ = 0.0f;
 
         const int seg_beg = seg_off[ipoint];
         const int seg_end = seg_off[ipoint + 1];
 
-        // Pass 1: accumulate alpha_sum, integral and the register reductions, along
-        // with a progressively computed qdotk_max.
-        for (int sg = seg_beg; sg < seg_end; sg++) {
+        if constexpr (TWO_PASS) {
 
-            const int iring = seg[3 * sg + 0];
-            const int seg_lo = seg[3 * sg + 1];
-            const int seg_len = seg[3 * sg + 2];
-
-            // constant along the arc: every point of a ring carries the same
-            // quadrature weight
-            const float qw_seg = ring_weights[iring];
-
-            // a ring is contiguous in RING order, so the flat column is the ring's
-            // base plus an offset that counts up and wraps at the ring's end
-            const int64_t ring_lo = ring_base[iring];
-            const int64_t ring_hi = ring_lo + ring_size[iring];
-
-            int64_t col = ring_lo + seg_lo;
-
-            // Grouped body: NB neighbours' addresses are formed first so their k and
-            // v loads are all outstanding before any is consumed, and the online
-            // softmax then rescales once per group instead of once per neighbour.
-            //
-            // This is the one place in the backward where grouping changes the
-            // arithmetic. Rescaling per group rather than per neighbour is the same
-            // reduction in exact arithmetic but a different order of fp32 sums, so
-            // the gradient differs in its last bits. That is why this lands now and
-            // not with the original port: the oracle gradient checks at 96 channels
-            // per head exist and pass, so the change is finally testable.
-            int j = 0;
-            for (; j + NB <= seg_len; j += NB) {
-
-                const STORAGE_T *kp[NB];
-                const STORAGE_T *vp[NB];
+            // dqy's two accumulators, live only in this formulation. The product grid
+            // carries a third array, loc_vw_[NLOC], every entry of which always holds the
+            // same number; it is the scalar alpha_vw_ here, for the reason spelled out in
+            // the generic kernel above.
+            COMPUTE_T loc_k__[NLOC];
+            COMPUTE_T loc_kvw[NLOC];
 #pragma unroll
-                for (int u = 0; u < NB; u++) {
-                    kp[u] = kx + col * ldi;
-                    vp[u] = vx + col * ldo;
+            for (int i = 0; i < NLOC; i++) {
+                loc_k__[i] = __vset<COMPUTE_T>(0.0f);
+                loc_kvw[i] = __vset<COMPUTE_T>(0.0f);
+            }
+
+            float alpha_sum = 0.0f;
+
+            // the scalar that replaces the replicated loc_vw_ array
+            float alpha_vw_ = 0.0f;
+
+            // Pass 1: accumulate alpha_sum, integral and the register reductions, along
+            // with a progressively computed qdotk_max.
+            for (int sg = seg_beg; sg < seg_end; sg++) {
+
+                const int iring = seg[3 * sg + 0];
+                const int seg_lo = seg[3 * sg + 1];
+                const int seg_len = seg[3 * sg + 2];
+
+                // constant along the arc: every point of a ring carries the same
+                // quadrature weight
+                const float qw_seg = ring_weights[iring];
+
+                // a ring is contiguous in RING order, so the flat column is the ring's
+                // base plus an offset that counts up and wraps at the ring's end
+                const int64_t ring_lo = ring_base[iring];
+                const int64_t ring_hi = ring_lo + ring_size[iring];
+
+                int64_t col = ring_lo + seg_lo;
+
+                // Grouped body: NB neighbours' addresses are formed first so their k and
+                // v loads are all outstanding before any is consumed, and the online
+                // softmax then rescales once per group instead of once per neighbour.
+                //
+                // This is the one place in the two-pass formulation where grouping changes
+                // the arithmetic. Rescaling per group rather than per neighbour is the same
+                // reduction in exact arithmetic but a different order of fp32 sums, so
+                // the gradient differs in its last bits. That is why grouping landed with
+                // e9092eb and not with the original port: the oracle gradient checks at 96
+                // channels per head exist and pass, so the change was finally testable.
+                int j = 0;
+                for (; j + NB <= seg_len; j += NB) {
+
+                    const STORAGE_T *kp[NB];
+                    const STORAGE_T *vp[NB];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        kp[u] = kx + col * ldi;
+                        vp[u] = vx + col * ldo;
+                        if (++col == ring_hi) { col = ring_lo; }
+                    }
+
+                    COMPUTE_T qdotk_g[NB];
+                    COMPUTE_T gdotv_g[NB];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        qdotk_g[u] = __vset<COMPUTE_T>(0.0f);
+                        gdotv_g[u] = __vset<COMPUTE_T>(0.0f);
+                    }
+
+                    // one channel step feeds 2*NB accumulators, so that many loads are
+                    // outstanding per step rather than two
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        const COMPUTE_T q = loc_qy[i];
+                        const COMPUTE_T d = loc_dy[i];
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], i * BDIM_X)));
+                            gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], i * BDIM_X)));
+                        }
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        const COMPUTE_T q = loc_qy[NLOC_M1];
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], NLOC_M1 * BDIM_X)));
+                        }
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                        const COMPUTE_T d = loc_dy[NLOC_M1];
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], NLOC_M1 * BDIM_X)));
+                        }
+                    }
+
+                    float qdotk_b[NB];
+                    float gdotv_b[NB];
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        qdotk_b[u] = __warp_sum(__vred(qdotk_g[u]));
+                        gdotv_b[u] = __warp_sum(__vred(gdotv_g[u]));
+                    }
+
+                    float qdotk_max_grp = qdotk_max;
+#pragma unroll
+                    for (int u = 0; u < NB; u++) { qdotk_max_grp = max(qdotk_max_grp, qdotk_b[u]); }
+                    const float mc_grp = expf(qdotk_max - qdotk_max_grp);
+
+                    // ag[u] is alpha_inz * gdotv, wanted once for the scalar recurrences
+                    // and again for each of the NLOC register accumulators
+                    float alpha_b[NB];
+                    float ag_b[NB];
+                    float alpha_grp = 0.0f;
+                    float ag_grp = 0.0f;
+#pragma unroll
+                    for (int u = 0; u < NB; u++) {
+                        alpha_b[u] = expf(qdotk_b[u] - qdotk_max_grp) * qw_seg;
+                        ag_b[u] = alpha_b[u] * gdotv_b[u];
+                        alpha_grp += alpha_b[u];
+                        ag_grp += ag_b[u];
+                    }
+
+                    alpha_sum = alpha_sum * mc_grp + alpha_grp;
+                    integral = integral * mc_grp + ag_grp;
+                    alpha_vw_ = alpha_vw_ * mc_grp + ag_grp;
+
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        COMPUTE_T k_acc = __vscale(mc_grp, loc_k__[i]);
+                        COMPUTE_T kvw_acc = __vscale(mc_grp, loc_kvw[i]);
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            const COMPUTE_T kxval = vload(kp[u], i * BDIM_X);
+                            k_acc = __vadd(k_acc, __vscale(alpha_b[u], kxval));
+                            kvw_acc = __vadd(kvw_acc, __vscale(ag_b[u], kxval));
+                        }
+                        loc_k__[i] = k_acc;
+                        loc_kvw[i] = kvw_acc;
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        COMPUTE_T k_acc = __vscale(mc_grp, loc_k__[NLOC_M1]);
+                        COMPUTE_T kvw_acc = __vscale(mc_grp, loc_kvw[NLOC_M1]);
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            const COMPUTE_T kxval = vload(kp[u], NLOC_M1 * BDIM_X);
+                            k_acc = __vadd(k_acc, __vscale(alpha_b[u], kxval));
+                            kvw_acc = __vadd(kvw_acc, __vscale(ag_b[u], kxval));
+                        }
+                        loc_k__[NLOC_M1] = k_acc;
+                        loc_kvw[NLOC_M1] = kvw_acc;
+                    }
+
+                    qdotk_max = qdotk_max_grp;
+                }
+
+                // remainder: fewer than NB neighbours left in this arc
+                for (; j < seg_len; j++) {
+
+                    const STORAGE_T *_kx = kx + col * ldi;
+                    const STORAGE_T *_vx = vx + col * ldo;
+
+                    COMPUTE_T qdotk_v = __vset<COMPUTE_T>(0.0f);
+                    COMPUTE_T gdotv_v = __vset<COMPUTE_T>(0.0f);
+
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        qdotk_v = __vadd(qdotk_v, __vmul(loc_qy[i], vload(_kx, i * BDIM_X)));
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        qdotk_v = __vadd(qdotk_v, __vmul(loc_qy[NLOC_M1], vload(_kx, NLOC_M1 * BDIM_X)));
+                    }
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        gdotv_v = __vadd(gdotv_v, __vmul(loc_dy[i], vload(_vx, i * BDIM_X)));
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                        gdotv_v = __vadd(gdotv_v, __vmul(loc_dy[NLOC_M1], vload(_vx, NLOC_M1 * BDIM_X)));
+                    }
+
+                    const float qdotk = __warp_sum(__vred(qdotk_v));
+                    const float gdotv = __warp_sum(__vred(gdotv_v));
+
+                    const float qdotk_max_tmp = max(qdotk_max, qdotk);
+                    const float alpha_inz = expf(qdotk - qdotk_max_tmp) * qw_seg;
+                    const float max_correction = expf(qdotk_max - qdotk_max_tmp);
+
+                    alpha_sum = alpha_sum * max_correction + alpha_inz;
+                    integral = integral * max_correction + alpha_inz * gdotv;
+
+                    const float ainz_gdotv = alpha_inz * gdotv;
+
+                    // same recurrence the per-channel array used to run, once
+                    alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv;
+
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        const COMPUTE_T kxval = vload(_kx, i * BDIM_X);
+                        loc_k__[i] = __vadd(__vscale(max_correction, loc_k__[i]), __vscale(alpha_inz, kxval));
+                        loc_kvw[i] = __vadd(__vscale(max_correction, loc_kvw[i]), __vscale(ainz_gdotv, kxval));
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        const COMPUTE_T kxval = vload(_kx, NLOC_M1 * BDIM_X);
+                        loc_k__[NLOC_M1] = __vadd(__vscale(max_correction, loc_k__[NLOC_M1]), __vscale(alpha_inz, kxval));
+                        loc_kvw[NLOC_M1]
+                            = __vadd(__vscale(max_correction, loc_kvw[NLOC_M1]), __vscale(ainz_gdotv, kxval));
+                    }
+
+                    qdotk_max = qdotk_max_tmp;
+
+                    // next point in the arc; wraps at most once
                     if (++col == ring_hi) { col = ring_lo; }
                 }
-
-                COMPUTE_T qdotk_g[NB];
-                COMPUTE_T gdotv_g[NB];
-#pragma unroll
-                for (int u = 0; u < NB; u++) {
-                    qdotk_g[u] = __vset<COMPUTE_T>(0.0f);
-                    gdotv_g[u] = __vset<COMPUTE_T>(0.0f);
-                }
-
-                // one channel step feeds 2*NB accumulators, so that many loads are
-                // outstanding per step rather than two
-#pragma unroll
-                for (int i = 0; i < NLOC_M1; i++) {
-                    const COMPUTE_T q = loc_qy[i];
-                    const COMPUTE_T d = loc_dy[i];
-#pragma unroll
-                    for (int u = 0; u < NB; u++) {
-                        qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], i * BDIM_X)));
-                        gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], i * BDIM_X)));
-                    }
-                }
-                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
-                    const COMPUTE_T q = loc_qy[NLOC_M1];
-#pragma unroll
-                    for (int u = 0; u < NB; u++) {
-                        qdotk_g[u] = __vadd(qdotk_g[u], __vmul(q, vload(kp[u], NLOC_M1 * BDIM_X)));
-                    }
-                }
-                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
-                    const COMPUTE_T d = loc_dy[NLOC_M1];
-#pragma unroll
-                    for (int u = 0; u < NB; u++) {
-                        gdotv_g[u] = __vadd(gdotv_g[u], __vmul(d, vload(vp[u], NLOC_M1 * BDIM_X)));
-                    }
-                }
-
-                float qdotk_b[NB];
-                float gdotv_b[NB];
-#pragma unroll
-                for (int u = 0; u < NB; u++) {
-                    qdotk_b[u] = __warp_sum(__vred(qdotk_g[u]));
-                    gdotv_b[u] = __warp_sum(__vred(gdotv_g[u]));
-                }
-
-                float qdotk_max_grp = qdotk_max;
-#pragma unroll
-                for (int u = 0; u < NB; u++) { qdotk_max_grp = max(qdotk_max_grp, qdotk_b[u]); }
-                const float mc_grp = expf(qdotk_max - qdotk_max_grp);
-
-                // ag[u] is alpha_inz * gdotv, wanted once for the scalar recurrences
-                // and again for each of the NLOC register accumulators
-                float alpha_b[NB];
-                float ag_b[NB];
-                float alpha_grp = 0.0f;
-                float ag_grp = 0.0f;
-#pragma unroll
-                for (int u = 0; u < NB; u++) {
-                    alpha_b[u] = expf(qdotk_b[u] - qdotk_max_grp) * qw_seg;
-                    ag_b[u] = alpha_b[u] * gdotv_b[u];
-                    alpha_grp += alpha_b[u];
-                    ag_grp += ag_b[u];
-                }
-
-                alpha_sum = alpha_sum * mc_grp + alpha_grp;
-                integral = integral * mc_grp + ag_grp;
-                alpha_vw_ = alpha_vw_ * mc_grp + ag_grp;
-
-#pragma unroll
-                for (int i = 0; i < NLOC_M1; i++) {
-                    COMPUTE_T k_acc = __vscale(mc_grp, loc_k__[i]);
-                    COMPUTE_T kvw_acc = __vscale(mc_grp, loc_kvw[i]);
-#pragma unroll
-                    for (int u = 0; u < NB; u++) {
-                        const COMPUTE_T kxval = vload(kp[u], i * BDIM_X);
-                        k_acc = __vadd(k_acc, __vscale(alpha_b[u], kxval));
-                        kvw_acc = __vadd(kvw_acc, __vscale(ag_b[u], kxval));
-                    }
-                    loc_k__[i] = k_acc;
-                    loc_kvw[i] = kvw_acc;
-                }
-                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
-                    COMPUTE_T k_acc = __vscale(mc_grp, loc_k__[NLOC_M1]);
-                    COMPUTE_T kvw_acc = __vscale(mc_grp, loc_kvw[NLOC_M1]);
-#pragma unroll
-                    for (int u = 0; u < NB; u++) {
-                        const COMPUTE_T kxval = vload(kp[u], NLOC_M1 * BDIM_X);
-                        k_acc = __vadd(k_acc, __vscale(alpha_b[u], kxval));
-                        kvw_acc = __vadd(kvw_acc, __vscale(ag_b[u], kxval));
-                    }
-                    loc_k__[NLOC_M1] = k_acc;
-                    loc_kvw[NLOC_M1] = kvw_acc;
-                }
-
-                qdotk_max = qdotk_max_grp;
             }
 
-            // remainder: fewer than NB neighbours left in this arc
-            for (; j < seg_len; j++) {
+            alpha_sum_inv = 1.0f / alpha_sum;
 
-                const STORAGE_T *_kx = kx + col * ldi;
-                const STORAGE_T *_vx = vx + col * ldo;
+            integral *= alpha_sum_inv;
 
-                COMPUTE_T qdotk_v = __vset<COMPUTE_T>(0.0f);
-                COMPUTE_T gdotv_v = __vset<COMPUTE_T>(0.0f);
+            // Write dqy (fp32 output)
+            const float alpha_sum_inv_sq = alpha_sum_inv * alpha_sum_inv;
 
 #pragma unroll
-                for (int i = 0; i < NLOC_M1; i++) {
-                    qdotk_v = __vadd(qdotk_v, __vmul(loc_qy[i], vload(_kx, i * BDIM_X)));
-                }
-                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
-                    qdotk_v = __vadd(qdotk_v, __vmul(loc_qy[NLOC_M1], vload(_kx, NLOC_M1 * BDIM_X)));
-                }
-#pragma unroll
-                for (int i = 0; i < NLOC_M1; i++) {
-                    gdotv_v = __vadd(gdotv_v, __vmul(loc_dy[i], vload(_vx, i * BDIM_X)));
-                }
-                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
-                    gdotv_v = __vadd(gdotv_v, __vmul(loc_dy[NLOC_M1], vload(_vx, NLOC_M1 * BDIM_X)));
-                }
-
-                const float qdotk = __warp_sum(__vred(qdotk_v));
-                const float gdotv = __warp_sum(__vred(gdotv_v));
-
-                const float qdotk_max_tmp = max(qdotk_max, qdotk);
-                const float alpha_inz = expf(qdotk - qdotk_max_tmp) * qw_seg;
-                const float max_correction = expf(qdotk_max - qdotk_max_tmp);
-
-                alpha_sum = alpha_sum * max_correction + alpha_inz;
-                integral = integral * max_correction + alpha_inz * gdotv;
-
-                const float ainz_gdotv = alpha_inz * gdotv;
-
-                // same recurrence the per-channel array used to run, once
-                alpha_vw_ = alpha_vw_ * max_correction + ainz_gdotv;
-
-#pragma unroll
-                for (int i = 0; i < NLOC_M1; i++) {
-                    const COMPUTE_T kxval = vload(_kx, i * BDIM_X);
-                    loc_k__[i] = __vadd(__vscale(max_correction, loc_k__[i]), __vscale(alpha_inz, kxval));
-                    loc_kvw[i] = __vadd(__vscale(max_correction, loc_kvw[i]), __vscale(ainz_gdotv, kxval));
-                }
-                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
-                    const COMPUTE_T kxval = vload(_kx, NLOC_M1 * BDIM_X);
-                    loc_k__[NLOC_M1] = __vadd(__vscale(max_correction, loc_k__[NLOC_M1]), __vscale(alpha_inz, kxval));
-                    loc_kvw[NLOC_M1] = __vadd(__vscale(max_correction, loc_kvw[NLOC_M1]), __vscale(ainz_gdotv, kxval));
-                }
-
-                qdotk_max = qdotk_max_tmp;
-
-                // next point in the arc; wraps at most once
-                if (++col == ring_hi) { col = ring_lo; }
+            for (int i = 0; i < NLOC_M1; i++) {
+                // __vscale by the scalar, where the product grid __vmul-s by a vector every
+                // entry of which holds that scalar
+                dqy[i * BDIM_X] = __vscale(alpha_sum_inv_sq,
+                                           __vsub(__vscale(alpha_sum, loc_kvw[i]), __vscale(alpha_vw_, loc_k__[i])));
             }
+            if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                dqy[NLOC_M1 * BDIM_X]
+                    = __vscale(alpha_sum_inv_sq,
+                               __vsub(__vscale(alpha_sum, loc_kvw[NLOC_M1]), __vscale(alpha_vw_, loc_k__[NLOC_M1])));
+            }
+
+        } else {
+
+            const int64_t istat = int64_t(bh) * npoints_out + ipoint;
+
+            qdotk_max = qdotk_max_fwd[istat];
+            integral = integral_fwd[istat];
+            alpha_sum_inv = 1.0f / alpha_sum_fwd[istat];
         }
 
-        const float alpha_sum_inv = 1.0f / alpha_sum;
-
-        integral *= alpha_sum_inv;
-
-        // Write dqy (fp32 output)
-        const float alpha_sum_inv_sq = alpha_sum_inv * alpha_sum_inv;
-
-#pragma unroll
-        for (int i = 0; i < NLOC_M1; i++) {
-            // __vscale by the scalar, where the product grid __vmul-s by a vector every
-            // entry of which holds that scalar
-            dqy[i * BDIM_X]
-                = __vscale(alpha_sum_inv_sq, __vsub(__vscale(alpha_sum, loc_kvw[i]), __vscale(alpha_vw_, loc_k__[i])));
-        }
-        if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
-            dqy[NLOC_M1 * BDIM_X] = __vscale(
-                alpha_sum_inv_sq, __vsub(__vscale(alpha_sum, loc_kvw[NLOC_M1]), __vscale(alpha_vw_, loc_k__[NLOC_M1])));
-        }
-
-        // Pass 2: replay the arcs with the final qdotk_max to scatter dk/dv.
+        // The walk; see the generic kernel for which gradients it carries in which
+        // formulation.
         for (int sg = seg_beg; sg < seg_end; sg++) {
 
             const int iring = seg[3 * sg + 0];
@@ -794,11 +900,12 @@ namespace attention_kernels
 
             int64_t col = ring_lo + seg_lo;
 
-            // Grouped, exactly as pass 1 but without the caveat: there is no running
-            // maximum left to update here, so each neighbour's contribution is
-            // computed independently of the others and the sums it feeds are the
-            // atomics, which were never ordered. Grouping this walk is therefore
-            // bit-identical, not merely equivalent in exact arithmetic.
+            // Grouped, and without the caveat the two-pass first walk carries: there is
+            // no running maximum to update here, so each neighbour's contribution is
+            // computed independently of the others. Under TWO_PASS the only sums it
+            // feeds are the atomics, which were never ordered, so grouping is
+            // bit-identical there; in the single-pass formulation it also feeds loc_dq,
+            // where NB fixes the order of an fp32 sum as it does in pass 1.
             int j = 0;
             for (; j + NB <= seg_len; j += NB) {
 
@@ -860,18 +967,48 @@ namespace attention_kernels
                     gdotv_b[u] = __warp_sum(__vred(gdotv_g[u]));
                 }
 
+                // Both multipliers for the whole group up front. Identity (3): these are
+                // (gdotv_i - integral) * p_i and p_i, and identity (2) says the first is
+                // also the weight k_i carries into dqy -- which wants them
+                // channel-outer, so they cannot stay inside the scatter's loop.
+                float scale_fact_qy[NB];
+                float scale_fact_dy[NB];
+#pragma unroll
+                for (int u = 0; u < NB; u++) {
+                    const float alpha_inz_u = expf(qdotk_b[u] - qdotk_max) * qw_seg;
+                    const float alpha_mul_u = alpha_inz_u * alpha_sum_inv;
+
+                    scale_fact_qy[u] = (gdotv_b[u] - integral) * alpha_mul_u;
+                    scale_fact_dy[u] = alpha_mul_u;
+                }
+
+                // one channel step feeds NB terms of dqy, matching the loads already in
+                // flight for the reductions above
+                if constexpr (!TWO_PASS) {
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        COMPUTE_T dq_acc = loc_dq[i];
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            dq_acc = __vadd(dq_acc, __vscale(scale_fact_qy[u], vload(kp[u], i * BDIM_X)));
+                        }
+                        loc_dq[i] = dq_acc;
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        COMPUTE_T dq_acc = loc_dq[NLOC_M1];
+#pragma unroll
+                        for (int u = 0; u < NB; u++) {
+                            dq_acc = __vadd(dq_acc, __vscale(scale_fact_qy[u], vload(kp[u], NLOC_M1 * BDIM_X)));
+                        }
+                        loc_dq[NLOC_M1] = dq_acc;
+                    }
+                }
+
 #pragma unroll
                 for (int u = 0; u < NB; u++) {
 
-                    const float alpha_inz_u = expf(qdotk_b[u] - qdotk_max) * qw_seg;
-
                     COMPUTE_T *_dkx = dkx + cols[u] * ldi;
                     COMPUTE_T *_dvx = dvx + cols[u] * ldo;
-
-                    const float alpha_mul_u = alpha_inz_u * alpha_sum_inv;
-
-                    const float scale_fact_qy = (gdotv_b[u] - integral) * alpha_mul_u;
-                    const float scale_fact_dy = alpha_mul_u;
 
 #if __CUDA_ARCH__ < 900
                     constexpr int VEC_SIZE = sizeof(COMPUTE_T) / sizeof(float);
@@ -882,25 +1019,25 @@ namespace attention_kernels
                     float *_dvx_scl = reinterpret_cast<float *>(_dvx) - tidx * VEC_SIZE;
 
                     for (int chan = tidx; chan < nchan_in * VEC_SIZE; chan += BDIM_X) {
-                        atomicAdd(_dkx_scl + chan, scale_fact_qy * sh_qy_scl[chan]);
+                        atomicAdd(_dkx_scl + chan, scale_fact_qy[u] * sh_qy_scl[chan]);
                     }
                     for (int chan = tidx; chan < nchan_out * VEC_SIZE; chan += BDIM_X) {
-                        atomicAdd(_dvx_scl + chan, scale_fact_dy * sh_dy_scl[chan]);
+                        atomicAdd(_dvx_scl + chan, scale_fact_dy[u] * sh_dy_scl[chan]);
                     }
 #else
 #pragma unroll
                     for (int i = 0; i < NLOC_M1; i++) {
-                        atomicAdd(_dkx + i * BDIM_X, __vscale(scale_fact_qy, loc_qy[i]));
+                        atomicAdd(_dkx + i * BDIM_X, __vscale(scale_fact_qy[u], loc_qy[i]));
                     }
                     if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
-                        atomicAdd(_dkx + NLOC_M1 * BDIM_X, __vscale(scale_fact_qy, loc_qy[NLOC_M1]));
+                        atomicAdd(_dkx + NLOC_M1 * BDIM_X, __vscale(scale_fact_qy[u], loc_qy[NLOC_M1]));
                     }
 #pragma unroll
                     for (int i = 0; i < NLOC_M1; i++) {
-                        atomicAdd(_dvx + i * BDIM_X, __vscale(scale_fact_dy, loc_dy[i]));
+                        atomicAdd(_dvx + i * BDIM_X, __vscale(scale_fact_dy[u], loc_dy[i]));
                     }
                     if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
-                        atomicAdd(_dvx + NLOC_M1 * BDIM_X, __vscale(scale_fact_dy, loc_dy[NLOC_M1]));
+                        atomicAdd(_dvx + NLOC_M1 * BDIM_X, __vscale(scale_fact_dy[u], loc_dy[NLOC_M1]));
                     }
 #endif
                 }
@@ -946,6 +1083,18 @@ namespace attention_kernels
                 const float scale_fact_qy = (gdotv - integral) * alpha_mul;
                 const float scale_fact_dy = alpha_mul;
 
+                // dqy by identity (2)
+                if constexpr (!TWO_PASS) {
+#pragma unroll
+                    for (int i = 0; i < NLOC_M1; i++) {
+                        loc_dq[i] = __vadd(loc_dq[i], __vscale(scale_fact_qy, vload(_kx, i * BDIM_X)));
+                    }
+                    if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                        loc_dq[NLOC_M1]
+                            = __vadd(loc_dq[NLOC_M1], __vscale(scale_fact_qy, vload(_kx, NLOC_M1 * BDIM_X)));
+                    }
+                }
+
                 // float4, 128-bit atomics are only supported by devices of compute
                 // capability 9.x+, so on older devices we resort to 32-bit atomics
 
@@ -990,16 +1139,25 @@ namespace attention_kernels
             }
         }
 
+        // Write dqy (fp32 output). No reciprocal and no combination: alpha_sum_inv went
+        // into every term as it was accumulated.
+        if constexpr (!TWO_PASS) {
+#pragma unroll
+            for (int i = 0; i < NLOC_M1; i++) { dqy[i * BDIM_X] = loc_dq[i]; }
+            if (NLOC_M1 * BDIM_X + tidx < nchan_in) { dqy[NLOC_M1 * BDIM_X] = loc_dq[NLOC_M1]; }
+        }
+
         return;
     }
 
     // Resolve NLOC, which has to be a compile-time constant, from the runtime channel
     // count by walking the supported range. Mirrors launch_spc_attn_fwd_ragged, and so
     // launch_spc_attn_bwd, minus its CHOUT_AS_IN branch (see the kernel).
-    template <int BDIM_X, int BDIM_Y, int CUR_LOC, int MAX_LOC, typename STORAGE_T>
+    template <int BDIM_X, int BDIM_Y, int CUR_LOC, int MAX_LOC, bool TWO_PASS, typename STORAGE_T>
     static void launch_spc_attn_bwd_ragged(int nloc, int batch_size, int nheads, int nchans_in, int nchans_out,
                                            int64_t npoints_in, int64_t npoints_out, const STORAGE_T *_kxp,
                                            const STORAGE_T *_vxp, const STORAGE_T *_qyp, const STORAGE_T *_dyp,
+                                           const float *_alpha_sum, const float *_qdotk_max, const float *_integral,
                                            const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
                                            const int64_t *_ring_size, const float *_ring_weights,
                                            typename vec_traits<STORAGE_T>::compute_t *_dkxp,
@@ -1014,19 +1172,20 @@ namespace attention_kernels
                 dim3 block(BDIM_X, BDIM_Y);
                 dim3 grid(DIV_UP(npoints_out, block.y), batch_size * nheads);
 
-                // 2 arrays per warp, against the generic kernel's 4: only qy and dy are
-                // staged, and only for the pre-9.0 epilogue
+                // 2 arrays per warp, against the generic kernel's 3 or 4: only qy and dy
+                // are staged, and only for the pre-9.0 epilogue
                 size_t shsize = sizeof(typename vec_traits<STORAGE_T>::compute_t) * (nchans_in + nchans_out) * block.y;
 
-                s2_attn_bwd_ragged_special_vec_k<BDIM_X, BDIM_Y, CUR_LOC><<<grid, block, shsize, stream>>>(
-                    nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _seg, _seg_off,
-                    _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp, _dqyp);
+                s2_attn_bwd_ragged_special_vec_k<BDIM_X, BDIM_Y, CUR_LOC, TWO_PASS><<<grid, block, shsize, stream>>>(
+                    nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _alpha_sum,
+                    _qdotk_max, _integral, _seg, _seg_off, _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp, _dqyp);
                 CHECK_ERROR("s2_attn_bwd_ragged_special_vec_k");
                 return;
             }
-            launch_spc_attn_bwd_ragged<BDIM_X, BDIM_Y, CUR_LOC + 1, MAX_LOC, STORAGE_T>(
-                nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _seg,
-                _seg_off, _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp, _dqyp, stream);
+            launch_spc_attn_bwd_ragged<BDIM_X, BDIM_Y, CUR_LOC + 1, MAX_LOC, TWO_PASS, STORAGE_T>(
+                nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp,
+                _alpha_sum, _qdotk_max, _integral, _seg, _seg_off, _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp,
+                _dqyp, stream);
         }
     }
 
@@ -1043,10 +1202,26 @@ namespace attention_kernels
         return forced;
     }
 
-    template <typename STORAGE_T>
+    // Set TORCH_HARMONICS_RAGGED_BWD_TWO_PASS=1 to force the two-pass formulation, in
+    // whichever of the two kernels is selected. Separate again from _BWD_GENERIC, and
+    // for a sharper reason than that switch has: collapsing the two walks is exact in
+    // exact arithmetic but regroups fp32 sums, so it is the change here that can move a
+    // gradient's last bits. Telling that apart from a genuine error has to be possible
+    // at runtime, on the build a training job is already holding.
+    static bool ragged_bwd_two_pass()
+    {
+        static const bool forced = []() {
+            const char *env = std::getenv("TORCH_HARMONICS_RAGGED_BWD_TWO_PASS");
+            return env != nullptr && env[0] == '1';
+        }();
+        return forced;
+    }
+
+    template <bool TWO_PASS, typename STORAGE_T>
     static void launch_gen_attn_bwd_ragged(int batch_size, int nheads, int nchans_in, int nchans_out,
                                           int64_t npoints_in, int64_t npoints_out, const STORAGE_T *_kxp,
                                           const STORAGE_T *_vxp, const STORAGE_T *_qyp, const STORAGE_T *_dyp,
+                                          const float *_alpha_sum, const float *_qdotk_max, const float *_integral,
                                           const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
                                           const int64_t *_ring_size, const float *_ring_weights,
                                           typename vec_traits<STORAGE_T>::compute_t *_dkxp,
@@ -1058,9 +1233,11 @@ namespace attention_kernels
         // than taking the larger: NLOC also decides which registers go unguarded.
         const int nloc = DIV_UP(nchans_in, WARP_SIZE);
         if (!ragged_bwd_force_generic() && nchans_in == nchans_out && nloc <= MAX_LOCAL_ARR_LEN_RAGGED_BWD) {
-            launch_spc_attn_bwd_ragged<WARP_SIZE, THREADS / WARP_SIZE, 1, MAX_LOCAL_ARR_LEN_RAGGED_BWD, STORAGE_T>(
-                nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _seg,
-                _seg_off, _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp, _dqyp, stream);
+            launch_spc_attn_bwd_ragged<WARP_SIZE, THREADS / WARP_SIZE, 1, MAX_LOCAL_ARR_LEN_RAGGED_BWD, TWO_PASS,
+                                       STORAGE_T>(nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in,
+                                                  npoints_out, _kxp, _vxp, _qyp, _dyp, _alpha_sum, _qdotk_max,
+                                                  _integral, _seg, _seg_off, _ring_base, _ring_size, _ring_weights,
+                                                  _dkxp, _dvxp, _dqyp, stream);
             return;
         }
 
@@ -1068,23 +1245,59 @@ namespace attention_kernels
         // one block row per (batch, head) pair
         dim3 grid(DIV_UP(npoints_out, block.y), batch_size * nheads);
 
-        // shared memory holds compute-type (COMPUTE_T) data, not STORAGE_T. 4 arrays
-        // per warp; the fifth was alpha_vw_, which is a scalar (see the kernel).
-        size_t shsize = sizeof(typename vec_traits<STORAGE_T>::compute_t) * (nchans_in * 3 + nchans_out) * block.y;
+        // shared memory holds compute-type (COMPUTE_T) data, not STORAGE_T. One
+        // accumulator per warp in the single-pass formulation and two in the two-pass
+        // one, plus dy and qy; alpha_vw_ was never an array here (see the kernel).
+        constexpr int NACC = TWO_PASS ? 2 : 1;
+        size_t shsize
+            = sizeof(typename vec_traits<STORAGE_T>::compute_t) * (nchans_in * (NACC + 1) + nchans_out) * block.y;
 
-        s2_attn_bwd_ragged_generic_vec_k<THREADS><<<grid, block, shsize, stream>>>(
-            nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _seg, _seg_off, _ring_base,
-            _ring_size, _ring_weights, _dkxp, _dvxp, _dqyp);
+        s2_attn_bwd_ragged_generic_vec_k<THREADS, TWO_PASS><<<grid, block, shsize, stream>>>(
+            nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _dyp, _alpha_sum, _qdotk_max,
+            _integral, _seg, _seg_off, _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp, _dqyp);
         CHECK_ERROR("s2_attn_bwd_ragged_generic_vec_k");
 
         return;
     }
 
+    // Instantiate both formulations and pick one at launch. TWO_PASS cannot be a runtime
+    // flag -- it decides which accumulators exist, and so the register and shared-memory
+    // footprint -- but it has to be selectable without a rebuild, which is the whole
+    // point of keeping the two-pass code.
+    template <typename STORAGE_T>
+    static void launch_attn_bwd_ragged(int batch_size, int nheads, int nchans_in, int nchans_out, int64_t npoints_in,
+                                       int64_t npoints_out, const STORAGE_T *_kxp, const STORAGE_T *_vxp,
+                                       const STORAGE_T *_qyp, const STORAGE_T *_dyp, const float *_alpha_sum,
+                                       const float *_qdotk_max, const float *_integral, const int32_t *_seg,
+                                       const int32_t *_seg_off, const int64_t *_ring_base, const int64_t *_ring_size,
+                                       const float *_ring_weights, typename vec_traits<STORAGE_T>::compute_t *_dkxp,
+                                       typename vec_traits<STORAGE_T>::compute_t *_dvxp,
+                                       typename vec_traits<STORAGE_T>::compute_t *_dqyp, cudaStream_t stream)
+    {
+        if (ragged_bwd_two_pass()) {
+            launch_gen_attn_bwd_ragged<true, STORAGE_T>(batch_size, nheads, nchans_in, nchans_out, npoints_in,
+                                                        npoints_out, _kxp, _vxp, _qyp, _dyp, _alpha_sum, _qdotk_max,
+                                                        _integral, _seg, _seg_off, _ring_base, _ring_size,
+                                                        _ring_weights, _dkxp, _dvxp, _dqyp, stream);
+            return;
+        }
+        launch_gen_attn_bwd_ragged<false, STORAGE_T>(batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out,
+                                                     _kxp, _vxp, _qyp, _dyp, _alpha_sum, _qdotk_max, _integral, _seg,
+                                                     _seg_off, _ring_base, _ring_size, _ring_weights, _dkxp, _dvxp,
+                                                     _dqyp, stream);
+    }
+
     // NHWC ABI, flattened: see s2_attention_fwd_ragged_cuda. Argument order mirrors
-    // `forward_ragged` with dy inserted after qy, matching how `backward` mirrors
-    // `forward` on the product grids.
+    // `forward_ragged` with dy and then the forward's three returns inserted after qy,
+    // extending how `backward` mirrors `forward` on the product grids.
+    //
+    // y, alpha_sum and qdotk_max are what make one traversal possible: the first gives
+    // integral by identity (1), the other two are the statistics the first walk used to
+    // rebuild. The two-pass formulation ignores all three, so nothing about the caller
+    // changes when TORCH_HARMONICS_RAGGED_BWD_TWO_PASS selects it.
     std::tuple<at::Tensor, at::Tensor, at::Tensor>
-    s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor ring_weights,
+    s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor y,
+                                 at::Tensor alpha_sum, at::Tensor qdotk_max, at::Tensor ring_weights,
                                  at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
                                  at::Tensor ring_size, int64_t num_heads, int64_t npoints_out)
     {
@@ -1092,6 +1305,9 @@ namespace attention_kernels
         CHECK_CUDA_INPUT_TENSOR(vx);
         CHECK_CUDA_INPUT_TENSOR(qy);
         CHECK_CUDA_INPUT_TENSOR(dy);
+        CHECK_CUDA_INPUT_TENSOR(y);
+        CHECK_CUDA_INPUT_TENSOR(alpha_sum);
+        CHECK_CUDA_INPUT_TENSOR(qdotk_max);
         CHECK_CUDA_TENSOR(ring_weights);
         CHECK_CUDA_TENSOR(psi_seg);
         CHECK_CUDA_TENSOR(psi_seg_off);
@@ -1102,6 +1318,7 @@ namespace attention_kernels
         TORCH_CHECK(vx.dim() == 3, "vx must be (B, npoints_in, num_heads * C_v), got ", vx.dim(), " dims");
         TORCH_CHECK(qy.dim() == 3, "qy must be (B, npoints_out, num_heads * C_k), got ", qy.dim(), " dims");
         TORCH_CHECK(dy.dim() == 3, "dy must be (B, npoints_out, num_heads * C_v), got ", dy.dim(), " dims");
+        TORCH_CHECK(y.dim() == 3, "y must be (B, npoints_out, num_heads * C_v), got ", y.dim(), " dims");
 
         TORCH_CHECK(num_heads >= 1, "num_heads must be positive, got ", num_heads);
         TORCH_CHECK(qy.size(2) % num_heads == 0, "q/k channel count (", qy.size(2),
@@ -1121,6 +1338,14 @@ namespace attention_kernels
         TORCH_CHECK(ring_weights.size(0) == ring_base.size(0), "ring_weights must have one entry per input ring, got ",
                     ring_weights.size(0), " for ", ring_base.size(0), " rings");
 
+        TORCH_CHECK(y.sizes() == dy.sizes(), "y must have dy's shape, got ", y.sizes(), " against ", dy.sizes());
+        for (const auto &stat : {std::make_pair("alpha_sum", alpha_sum), std::make_pair("qdotk_max", qdotk_max)}) {
+            TORCH_CHECK(stat.second.dim() == 3 && stat.second.size(0) == kx.size(0)
+                            && stat.second.size(1) == num_heads && stat.second.size(2) == npoints_out,
+                        stat.first, " must be (B, num_heads, npoints_out) = (", kx.size(0), ", ", num_heads, ", ",
+                        npoints_out, "), got ", stat.second.sizes());
+        }
+
         // Every activation must share one dtype: the dispatch below selects a single
         // scalar_t from qy and the launcher reinterpret_casts k/v/q/dy to it, so a
         // mismatched input would be reinterpreted rather than converted.
@@ -1130,6 +1355,8 @@ namespace attention_kernels
                     qy.scalar_type(), ")");
         TORCH_CHECK(dy.scalar_type() == qy.scalar_type(), "dy dtype (", dy.scalar_type(), ") must match q dtype (",
                     qy.scalar_type(), ")");
+        TORCH_CHECK(y.scalar_type() == qy.scalar_type(), "y dtype (", y.scalar_type(), ") must match q dtype (",
+                    qy.scalar_type(), ")");
 
         // ring_weights is read as float32 whatever scalar_t the dispatch picks, so it
         // is the one tensor that must not follow the activations. Casting a whole
@@ -1137,6 +1364,13 @@ namespace attention_kernels
         // computes silent garbage instead of failing.
         TORCH_CHECK(ring_weights.scalar_type() == at::kFloat, "ring_weights must be float32, got ",
                     ring_weights.scalar_type());
+
+        // The softmax statistics are fp32 whatever the activations are, for the same
+        // reason: the kernel reads them as float unconditionally.
+        TORCH_CHECK(alpha_sum.scalar_type() == at::kFloat, "alpha_sum must be float32, got ",
+                    alpha_sum.scalar_type());
+        TORCH_CHECK(qdotk_max.scalar_type() == at::kFloat, "qdotk_max must be float32, got ",
+                    qdotk_max.scalar_type());
 
         // per-head channel counts; the packed extent is num_heads times these
         const int nchans_in = qy.size(2) / num_heads; // or kx.size(2) / num_heads
@@ -1150,6 +1384,24 @@ namespace attention_kernels
         auto qy_type = qy.dtype();
 
         torch::Tensor dkx, dvx, dqy;
+
+        // integral = dy . out per (batch, head, point), by identity (1). Done here
+        // rather than in the kernel because at O(nchan) per point it is a rounding
+        // error against the neighbourhood walk it replaces -- a reduction over 96
+        // channels against 102 of them -- and because getting it wrong in torch is
+        // visible, where getting it wrong in a warp reduction is not.
+        //
+        // fp32, and in fp32 arithmetic, because that is what the walk it replaces
+        // accumulated in: vload widens every activation at the load site. Laid out to
+        // match alpha_sum and qdotk_max, which the transpose is for -- the product is
+        // natural in (batch, point, head) and the kernel indexes by batch * nheads +
+        // head.
+        const int64_t per_head[] = {batch_size, npoints_out, num_heads, nchans_out};
+        const int64_t chan_dim = 3;
+        torch::Tensor integral = (dy.reshape(per_head).to(at::kFloat) * y.reshape(per_head).to(at::kFloat))
+                                     .sum(chan_dim)
+                                     .transpose(1, 2)
+                                     .contiguous();
 
         // Activations stay in their native dtype and are widened to fp32 at load.
         // Gradient buffers are allocated fp32 because dkx/dvx are atomically
@@ -1171,10 +1423,13 @@ namespace attention_kernels
 
             using compute_t = typename vec_traits<storage_t>::compute_t;
 
-            launch_gen_attn_bwd_ragged<storage_t>(
+            launch_attn_bwd_ragged<storage_t>(
                 batch_size, num_heads, nchans_in, nchans_out, npoints_in, npoints_out,
                 reinterpret_cast<const storage_t *>(kx.data_ptr()), reinterpret_cast<const storage_t *>(vx.data_ptr()),
                 reinterpret_cast<const storage_t *>(qy.data_ptr()), reinterpret_cast<const storage_t *>(dy.data_ptr()),
+                reinterpret_cast<const float *>(alpha_sum.data_ptr()),
+                reinterpret_cast<const float *>(qdotk_max.data_ptr()),
+                reinterpret_cast<const float *>(integral.data_ptr()),
                 reinterpret_cast<const int32_t *>(psi_seg.data_ptr()),
                 reinterpret_cast<const int32_t *>(psi_seg_off.data_ptr()),
                 reinterpret_cast<const int64_t *>(ring_base.data_ptr()),

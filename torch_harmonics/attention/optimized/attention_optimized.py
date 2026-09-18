@@ -118,11 +118,18 @@ if optimized_kernels_is_available():
             ring_size: torch.Tensor,
             num_heads: int,
             npoints_out: int,
-        ) -> torch.Tensor:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             # NHWC with the spatial axes flattened: (B, npoints_out, num_heads * C_v).
             # The channel extent comes from vw, which already carries the packed width.
             out_shape = (kw.shape[0], npoints_out, vw.shape[2])
-            return torch.empty(out_shape, dtype=kw.dtype, device=kw.device)
+            # The softmax statistics are per (batch, head, point) and float32 whatever
+            # the activations are, so the backward can read them as float unconditionally.
+            stat_shape = (kw.shape[0], num_heads, npoints_out)
+            return (
+                torch.empty(out_shape, dtype=kw.dtype, device=kw.device),
+                torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
+                torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
+            )
 
     # raw ragged backward fake, gated for the same reason as the forward above.
     if _op_is_declared("backward_ragged"):
@@ -133,6 +140,9 @@ if optimized_kernels_is_available():
             vw: torch.Tensor,
             qw: torch.Tensor,
             dy: torch.Tensor,
+            y: torch.Tensor,
+            alpha_sum: torch.Tensor,
+            qdotk_max: torch.Tensor,
             ring_weights: torch.Tensor,
             seg: torch.Tensor,
             seg_off: torch.Tensor,
@@ -350,6 +360,12 @@ if optimized_kernels_is_available():
     # gradient, i.e. in training rather than at import.
     if _op_is_declared("forward_ragged") and _op_is_declared("backward_ragged"):
 
+        # Three outputs, one of them the actual result. alpha_sum and qdotk_max are the
+        # forward's softmax statistics, returned rather than discarded so the backward
+        # can walk each neighbourhood once instead of twice. They have to be *outputs*
+        # rather than something stashed on the side, because setup_context only ever
+        # sees a custom op's inputs and outputs -- which is the same reason
+        # torch.ops.aten._scaled_dot_product_flash_attention returns its logsumexp.
         @torch.library.custom_op("attention_kernels::_neighborhood_s2_attention_ragged_optimized", mutates_args=())
         def _neighborhood_s2_attention_ragged_optimized(
             kw: torch.Tensor,
@@ -362,7 +378,7 @@ if optimized_kernels_is_available():
             ring_size: torch.Tensor,
             nh: int,
             npoints_out: int,
-        ) -> torch.Tensor:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             # NHWC with the spatial axes flattened, heads packed along channels, in
             # the grid's flat point order (RING for HEALPix). Native dtype is kept;
             # the kernel widens at the load site.
@@ -386,12 +402,20 @@ if optimized_kernels_is_available():
             ring_size: torch.Tensor,
             nh: int,
             npoints_out: int,
-        ) -> torch.Tensor:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             out_shape = (kw.shape[0], npoints_out, vw.shape[2])
-            return torch.empty(out_shape, dtype=kw.dtype, device=kw.device)
+            stat_shape = (kw.shape[0], nh, npoints_out)
+            return (
+                torch.empty(out_shape, dtype=kw.dtype, device=kw.device),
+                torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
+                torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
+            )
 
-        def _neighborhood_s2_attention_ragged_bwd_optimized(ctx, grad_output):
-            seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw = ctx.saved_tensors
+        # grad_alpha_sum and grad_qdotk_max arrive because autograd calls backward with
+        # one grad per output; setup_context marks both statistics non-differentiable, so
+        # they are zeros and nothing downstream can route a gradient through them.
+        def _neighborhood_s2_attention_ragged_bwd_optimized(ctx, grad_output, grad_alpha_sum, grad_qdotk_max):
+            seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw, y, alpha_sum, qdotk_max = ctx.saved_tensors
 
             kw = kw.contiguous()
             vw = vw.contiguous()
@@ -399,7 +423,20 @@ if optimized_kernels_is_available():
             grad_output = grad_output.contiguous()
 
             dkw, dvw, dqw = attention_kernels.backward_ragged.default(
-                kw, vw, qw, grad_output, ring_weights, seg, seg_off, ring_base, ring_size, ctx.nh, ctx.npoints_out
+                kw,
+                vw,
+                qw,
+                grad_output,
+                y,
+                alpha_sum,
+                qdotk_max,
+                ring_weights,
+                seg,
+                seg_off,
+                ring_base,
+                ring_size,
+                ctx.nh,
+                ctx.npoints_out,
             )
 
             # one gradient per forward input: kw, vw, qw, then None for
