@@ -521,6 +521,28 @@ class NeighborhoodAttentionS2(nn.Module):
         self.attention_handle = _neighborhood_s2_attention_ragged_torch
         self.attention_handle_optimized = _neighborhood_s2_attention_ragged_optimized
 
+    def __getattr__(self, name):
+        """
+        Materialise the ragged CSR column list on attribute access.
+
+        It stopped being a registered buffer so it would not sit in memory unread on
+        the CUDA path, but it is part of this class's surface: the test suite reads
+        psi_col_idx and psi_roff_idx directly, and so may anything else. Keeping the
+        names working means the storage change is invisible to callers rather than a
+        breakage they have to be told about.
+
+        nn.Module resolves buffers in its own __getattr__, which Python only calls
+        after normal lookup fails, so delegating first leaves the product-grid path
+        -- where these really are buffers -- completely untouched.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name in ("psi_col_idx", "psi_roff_idx") and "psi_seg" in self._buffers:
+                col_idx, row_off = self._ragged_csr(self._buffers["psi_seg"].device)
+                return col_idx if name == "psi_col_idx" else row_off
+            raise
+
     def _ragged_csr(self, device):
         """
         The CSR column list, built on first use and cached.
