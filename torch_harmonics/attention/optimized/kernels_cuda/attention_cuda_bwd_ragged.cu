@@ -1208,13 +1208,32 @@ namespace attention_kernels
     // exact arithmetic but regroups fp32 sums, so it is the change here that can move a
     // gradient's last bits. Telling that apart from a genuine error has to be possible
     // at runtime, on the build a training job is already holding.
-    static bool ragged_bwd_two_pass()
+    //
+    // Defaults by dtype, because the collapse is exact in exact arithmetic but not in
+    // bfloat16. integral = dy . out is read from the *stored* output, and it is then
+    // subtracted: dqy and dk both carry (gdotv_i - integral). In fp32 and fp16 the
+    // rounding in that difference stays inside the suite's 3e-2 tolerance; in bf16,
+    // with 8 mantissa bits in out, it does not -- job 3835420 failed dk and dq there
+    // while dv, the one gradient that does not involve integral, passed, and fp32 and
+    // fp16 passed outright. The two-pass form never had the problem because it built
+    // gdotv_i and integral in the same fp32 accumulation from the same data, so the
+    // cancellation was between consistent quantities.
+    //
+    // So bf16 takes the two walks and everything else takes one. That is the
+    // conservative way round, and it is the unhelpful way round as well: bf16 is what
+    // training runs under, so the collapse currently buys nothing there. Recovering it
+    // needs integral built from something better than a bf16 output -- an fp32 copy of
+    // y is the obvious candidate and costs as much memory as the output itself, so it
+    // wants measuring against the 2x it would buy back rather than assuming.
+    static bool ragged_bwd_two_pass(at::ScalarType dtype)
     {
-        static const bool forced = []() {
+        static const int forced = []() {
             const char *env = std::getenv("TORCH_HARMONICS_RAGGED_BWD_TWO_PASS");
-            return env != nullptr && env[0] == '1';
+            if (env == nullptr) { return -1; }
+            return env[0] == '1' ? 1 : 0;
         }();
-        return forced;
+        if (forced >= 0) { return forced == 1; }
+        return dtype == at::kBFloat16;
     }
 
     template <bool TWO_PASS, typename STORAGE_T>
@@ -1274,7 +1293,7 @@ namespace attention_kernels
                                        typename vec_traits<STORAGE_T>::compute_t *_dvxp,
                                        typename vec_traits<STORAGE_T>::compute_t *_dqyp, cudaStream_t stream)
     {
-        if (ragged_bwd_two_pass()) {
+        if (ragged_bwd_two_pass(c10::CppTypeToScalarType<STORAGE_T>::value)) {
             launch_gen_attn_bwd_ragged<true, STORAGE_T>(batch_size, nheads, nchans_in, nchans_out, npoints_in,
                                                         npoints_out, _kxp, _vxp, _qyp, _dyp, _alpha_sum, _qdotk_max,
                                                         _integral, _seg, _seg_off, _ring_base, _ring_size,
