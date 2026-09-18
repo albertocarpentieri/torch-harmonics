@@ -1,7 +1,19 @@
 # HEALPix ragged neighbourhood attention — handover
 
-Branch: `acarpentieri/healpix-backend` (this repo, `torch-harmonics-hpx`)
-Companion branch: `ac/bench-disk-attn` in `../bench-disk` (benchmarks only)
+Branch: `acarpentieri/healpix-backend` — on the **fork**,
+`github.com/albertocarpentieri/torch-harmonics`, *not* `NVIDIA/torch-harmonics`.
+That trips people up: the NVIDIA remote is also configured here (as `origin` and
+`nvidia-ssh`) and this branch is not on it.
+
+Companion branch: `ac/bench-disk-attn` in the healda worktree `../bench-disk`
+(`gitlab-master.nvidia.com/earth-2/healda`) — benchmarks only, no kernel code.
+
+To get everything:
+
+```bash
+git clone -b acarpentieri/healpix-backend git@github.com:albertocarpentieri/torch-harmonics.git torch-harmonics-hpx
+git clone -b ac/bench-disk-attn ssh://git@gitlab-master.nvidia.com:12051/earth-2/healda.git bench-disk
+```
 
 This documents where the work stands, how to run it, and what is still open. It is
 written for someone picking it up cold, possibly on a different cluster.
@@ -42,16 +54,55 @@ porting fixes that already existed in the sibling file.
   logs/                       <- job output.
 ```
 
-`sbatch_scripts/` being untracked matters: **those scripts are not in any repo and
-will not come with a `git clone`.** Copy them by hand when moving clusters, or
-re-create them from this document.
+`sbatch_scripts/` in the project root is untracked and will not come with a clone.
+The ones this work needs are therefore vendored into **`scripts/cluster/`** in this
+repo, so they travel with the branch. They refer to each other by the
+`sbatch_scripts/...` paths they were written with; either run them from a checkout
+that has been copied into a `sbatch_scripts/` directory, or adjust the paths. They
+also hardcode this cluster's account, partition and container path — see below.
 
-Container:
-`/lustre/.../containers/healpix_container.sqsh` (~30 GB). It has CUDA 13.4, torch
-2.14, and — importantly — `torch_harmonics` installed **editable, pointing at
+**Everything in them that is cluster-specific, and must be changed elsewhere:**
+
+| what | value here | where |
+|---|---|---|
+| Slurm account | `coreai_climate_earth2` | `#SBATCH --account` in every job script |
+| partition / QOS | `batch` / `interactive` | `#SBATCH` lines |
+| GPU request | `--gres=gpu:4` | the QOS here rejects single-GPU requests with `QOSMinGRES`; the work is single-process and only uses `cuda:0` |
+| container | `/lustre/.../containers/healpix_container.sqsh` | `CONTAINER=` at the top of each script |
+| project root | `/home/acarpentieri/healda_project` | `PROJECT=` at the top of each script |
+
+The container is the part that needs real work on a new cluster, not just a path
+edit — see §2.1.
+
+### 2.1 The container, and what to do if you do not have it
+
+`/lustre/.../containers/healpix_container.sqsh` (~30 GB). CUDA 13.4, torch 2.14, and
+— importantly — `torch_harmonics` installed **editable, pointing at
 `/workspace/torch-harmonics-hpx`**. So the mounted source tree *is* the installed
 package, and the compiled `.so` lives in the tree rather than in the image. Building
 in place is what makes an edit take effect.
+
+**On another cluster this image will not exist**, and a generic torch image will not
+substitute: without the editable install, `import torch_harmonics` resolves to
+whatever is baked in and your edits do nothing — silently, which is the bad part.
+Verify before trusting any measurement:
+
+```bash
+python -c "import torch_harmonics as th; print(th.__file__)"
+# must print a path under the mounted source tree, not site-packages
+```
+
+`scripts/cluster/setup_healpix_container.sh` and `build_healpix_container.sh` are how
+this image was made; they install `earth2grid`, `torch-harmonics` and `healda` into a
+base image. Rebuilding is the clean route. The quicker route, if you have any image
+with a matching CUDA and torch, is to do the editable install at job start:
+
+```bash
+python -m pip install -q --no-deps --no-build-isolation -e /workspace/torch-harmonics-hpx
+```
+
+which is exactly what `bench_disk_attention.sh` already does for the healda worktree.
+Container writes are ephemeral, so it has to be repeated per job.
 
 ---
 
