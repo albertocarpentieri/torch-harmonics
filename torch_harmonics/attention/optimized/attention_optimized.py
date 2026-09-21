@@ -378,7 +378,7 @@ if optimized_kernels_is_available():
             ring_size: torch.Tensor,
             nh: int,
             npoints_out: int,
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             # NHWC with the spatial axes flattened, heads packed along channels, in
             # the grid's flat point order (RING for HEALPix). Native dtype is kept;
             # the kernel widens at the load site.
@@ -402,11 +402,15 @@ if optimized_kernels_is_available():
             ring_size: torch.Tensor,
             nh: int,
             npoints_out: int,
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             out_shape = (kw.shape[0], npoints_out, vw.shape[2])
             stat_shape = (kw.shape[0], nh, npoints_out)
+            # y_hi mirrors the CUDA side: output-shaped fp32 for bf16, empty otherwise.
+            # It is what lets bf16 take the backward's single walk -- see the schema.
+            hi_shape = out_shape if kw.dtype == torch.bfloat16 else (0,)
             return (
                 torch.empty(out_shape, dtype=kw.dtype, device=kw.device),
+                torch.empty(hi_shape, dtype=torch.float32, device=kw.device),
                 torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
                 torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
             )
@@ -414,8 +418,11 @@ if optimized_kernels_is_available():
         # grad_alpha_sum and grad_qdotk_max arrive because autograd calls backward with
         # one grad per output; setup_context marks both statistics non-differentiable, so
         # they are zeros and nothing downstream can route a gradient through them.
-        def _neighborhood_s2_attention_ragged_bwd_optimized(ctx, grad_output, grad_alpha_sum, grad_qdotk_max):
-            seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw, y, alpha_sum, qdotk_max = ctx.saved_tensors
+        def _neighborhood_s2_attention_ragged_bwd_optimized(
+            ctx, grad_output, grad_y_hi, grad_alpha_sum, grad_qdotk_max
+        ):
+            (seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw, y, y_hi, alpha_sum,
+             qdotk_max) = ctx.saved_tensors
 
             kw = kw.contiguous()
             vw = vw.contiguous()
@@ -428,6 +435,7 @@ if optimized_kernels_is_available():
                 qw,
                 grad_output,
                 y,
+                y_hi,
                 alpha_sum,
                 qdotk_max,
                 ring_weights,

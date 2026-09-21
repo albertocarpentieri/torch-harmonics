@@ -158,7 +158,10 @@ namespace attention_kernels
         // constant along a ring and therefore hoisted per arc, exactly as
         // quad_weights[hi] is on the product grids.
         //
-        // Returns (y, alpha_sum, qdotk_max). The two extra outputs are the per-output-
+        // Returns (y, y_hi, alpha_sum, qdotk_max). y_hi is an fp32 copy of the output,
+        // non-empty only for bf16: the backward's single walk gets integral = dy . y
+        // from the stored output, and bf16's 8 mantissa bits are not enough once that
+        // term is subtracted from quantities close to it. The other extra outputs are the per-output-
         // point softmax statistics -- the denominator and the running maximum that
         // stabilises it -- shaped (B, num_heads, npoints_out) and float32 whatever the
         // activations are, as ring_weights is and for the same reason. They are saved
@@ -168,7 +171,8 @@ namespace attention_kernels
         // `forward` does not have them because its backward has not been given the
         // same treatment.
         m.def("forward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor ring_weights, Tensor seg, Tensor seg_off, "
-              "Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> (Tensor, Tensor, Tensor)",
+              "Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> (Tensor, Tensor, Tensor, "
+              "Tensor)",
               {at::Tag::pt2_compliant_tag});
 
         // dy is inserted after qy, mirroring how `backward` extends `forward` on the
@@ -182,9 +186,9 @@ namespace attention_kernels
         // not change that: the accumulation is needed because neighbourhoods of
         // distinct output points overlap, which is a property of the neighbourhood
         // and not of the grid being a product grid.
-        m.def("backward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor dy, Tensor y, Tensor alpha_sum, "
-              "Tensor qdotk_max, Tensor ring_weights, Tensor seg, Tensor seg_off, Tensor ring_base, "
-              "Tensor ring_size, int num_heads, int npoints_out) -> (Tensor, Tensor, Tensor)",
+        m.def("backward_ragged(Tensor kx, Tensor vx, Tensor qy, Tensor dy, Tensor y, Tensor y_hi, "
+              "Tensor alpha_sum, Tensor qdotk_max, Tensor ring_weights, Tensor seg, Tensor seg_off, "
+              "Tensor ring_base, Tensor ring_size, int num_heads, int npoints_out) -> (Tensor, Tensor, Tensor)",
               {at::Tag::pt2_compliant_tag});
 
         // ---- Ring-step variants for DistributedNeighborhoodAttentionS2 ----

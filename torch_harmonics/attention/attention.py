@@ -803,10 +803,10 @@ class NeighborhoodAttentionS2(nn.Module):
                 # torch reference below takes the per-point weight and the CSR column
                 # list. Both describe the same neighbourhood -- see _setup_ragged.
                 #
-                # The kernel also returns its softmax statistics, which exist only so
-                # its own backward can use them; autograd carries them, nothing here
-                # does.
-                out, _, _ = self.attention_handle_optimized(
+                # The kernel also returns its softmax statistics and, in bf16, an fp32
+                # copy of the output. All three exist only so its own backward can use
+                # them; autograd carries them, nothing here does.
+                out, _, _, _ = self.attention_handle_optimized(
                     key,
                     value,
                     query_scaled,

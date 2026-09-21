@@ -159,6 +159,9 @@ namespace attention_kernels
         const STORAGE_T *__restrict__ vx, const STORAGE_T *__restrict__ qy, const int32_t *__restrict__ seg,
         const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
         const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y,
+        // see the special kernel: the unnarrowed copy the bf16 one-pass backward needs,
+        // or nullptr when the caller has not asked for it
+        typename vec_traits<STORAGE_T>::compute_t *__restrict__ y_hi,
         float *__restrict__ alpha_sum_out, // [batch][nheads][npoints_out], fp32
         float *__restrict__ qdotk_max_out) // [batch][nheads][npoints_out], fp32
     {
@@ -193,6 +196,10 @@ namespace attention_kernels
 
         qy += int64_t(batch) * npoints_out * ldi + int64_t(head) * nchan_in + ipoint * ldi;
         y += int64_t(batch) * npoints_out * ldo + int64_t(head) * nchan_out + ipoint * ldo;
+        // same offset, different element width -- see the special kernel
+        if (y_hi != nullptr) {
+            y_hi += int64_t(batch) * npoints_out * ldo + int64_t(head) * nchan_out + ipoint * ldo;
+        }
 
         float alpha_sum = 0.0f;
         float qdotk_max = -FLT_MAX;
@@ -262,7 +269,11 @@ namespace attention_kernels
         }
 
         alpha_sum = 1.0f / alpha_sum;
-        for (int chan = tidx; chan < nchan_out; chan += WARP_SIZE) { vstore(y, chan, __vscale(alpha_sum, shy[chan])); }
+        for (int chan = tidx; chan < nchan_out; chan += WARP_SIZE) {
+            const COMPUTE_T out = __vscale(alpha_sum, shy[chan]);
+            vstore(y, chan, out);
+            if (y_hi != nullptr) { vstore(y_hi, chan, out); }
+        }
 
         return;
     }
@@ -286,6 +297,13 @@ namespace attention_kernels
         const STORAGE_T *__restrict__ vx, const STORAGE_T *__restrict__ qy, const int32_t *__restrict__ seg,
         const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
         const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights, STORAGE_T *__restrict__ y,
+        // The same output again, unnarrowed, or nullptr. The backward's one-pass form
+        // gets integral = dy . out from the stored output, and in bf16 that output's 8
+        // mantissa bits are not enough: integral is subtracted from quantities close to
+        // it, so the cancellation amplifies the rounding past the suite's tolerance.
+        // Writing a second, full-precision copy is what lets bf16 take the one-pass
+        // path. Allocated by the caller only when it is needed, hence the null check.
+        typename vec_traits<STORAGE_T>::compute_t *__restrict__ y_hi,
         float *__restrict__ alpha_sum_out, // [batch][nheads][npoints_out], fp32
         float *__restrict__ qdotk_max_out) // [batch][nheads][npoints_out], fp32
     {
@@ -327,6 +345,12 @@ namespace attention_kernels
         kx += int64_t(batch) * npoints_in * ldi + int64_t(head) * nchan_in + tidx;
         vx += int64_t(batch) * npoints_in * ldo + int64_t(head) * nchan_out + tidx;
         y += int64_t(batch) * npoints_out * ldo + int64_t(head) * nchan_out + ipoint * ldo + tidx;
+        // COMPUTE_T and STORAGE_T are one vector element each in this indexing -- the
+        // bf16 path pairs bf164 with float4, four channels either way -- so the offset
+        // is the same expression and only the element width differs.
+        if (y_hi != nullptr) {
+            y_hi += int64_t(batch) * npoints_out * ldo + int64_t(head) * nchan_out + ipoint * ldo + tidx;
+        }
 
         COMPUTE_T locy[NLOC];
 #pragma unroll
@@ -468,9 +492,15 @@ namespace attention_kernels
 
         const float alpha_inv = 1.0f / alpha_sum;
 #pragma unroll
-        for (int i = 0; i < NLOC_M1; i++) { vstore(y, i * BDIM_X, __vscale(alpha_inv, locy[i])); }
+        for (int i = 0; i < NLOC_M1; i++) {
+            const COMPUTE_T out = __vscale(alpha_inv, locy[i]);
+            vstore(y, i * BDIM_X, out);
+            if (y_hi != nullptr) { vstore(y_hi, i * BDIM_X, out); }
+        }
         if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
-            vstore(y, NLOC_M1 * BDIM_X, __vscale(alpha_inv, locy[NLOC_M1]));
+            const COMPUTE_T out = __vscale(alpha_inv, locy[NLOC_M1]);
+            vstore(y, NLOC_M1 * BDIM_X, out);
+            if (y_hi != nullptr) { vstore(y_hi, NLOC_M1 * BDIM_X, out); }
         }
 
         return;
@@ -484,7 +514,8 @@ namespace attention_kernels
                                            const STORAGE_T *__restrict__ _vxp, const STORAGE_T *__restrict__ _qyp,
                                            const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
                                            const int64_t *_ring_size, const float *_ring_weights,
-                                           STORAGE_T *__restrict__ _yp, float *_alpha_sum, float *_qdotk_max,
+                                           STORAGE_T *__restrict__ _yp, typename vec_traits<STORAGE_T>::compute_t *__restrict__ _y_hi,
+                                           float *_alpha_sum, float *_qdotk_max,
                                            cudaStream_t stream)
     {
         if constexpr (CUR_LOC > MAX_LOC) {
@@ -500,13 +531,13 @@ namespace attention_kernels
 
                 s2_attn_fwd_ragged_special_vec_k<BDIM_X, BDIM_Y, CUR_LOC><<<grid, block, shsize, stream>>>(
                     nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg, _seg_off,
-                    _ring_base, _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max);
+                    _ring_base, _ring_size, _ring_weights, _yp, _y_hi, _alpha_sum, _qdotk_max);
                 CHECK_ERROR("s2_attn_fwd_ragged_special_vec_k");
                 return;
             }
             launch_spc_attn_fwd_ragged<BDIM_X, BDIM_Y, CUR_LOC + 1, MAX_LOC, STORAGE_T>(
                 nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg,
-                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max, stream);
+                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, _y_hi, _alpha_sum, _qdotk_max, stream);
         }
     }
 
@@ -528,7 +559,8 @@ namespace attention_kernels
                                            const STORAGE_T *__restrict__ _vxp, const STORAGE_T *__restrict__ _qyp,
                                            const int32_t *_seg, const int32_t *_seg_off, const int64_t *_ring_base,
                                            const int64_t *_ring_size, const float *_ring_weights,
-                                           STORAGE_T *__restrict__ _yp, float *_alpha_sum, float *_qdotk_max,
+                                           STORAGE_T *__restrict__ _yp, typename vec_traits<STORAGE_T>::compute_t *__restrict__ _y_hi,
+                                           float *_alpha_sum, float *_qdotk_max,
                                            cudaStream_t stream)
     {
         // The register-blocked kernel needs NLOC == DIV_UP(nchan, WARP_SIZE) to hold for
@@ -538,7 +570,7 @@ namespace attention_kernels
         if (!ragged_force_generic() && nchans_in == nchans_out && nloc <= MAX_LOCAL_ARR_LEN_RAGGED) {
             launch_spc_attn_fwd_ragged<WARP_SIZE, THREADS / WARP_SIZE, 1, MAX_LOCAL_ARR_LEN_RAGGED, STORAGE_T>(
                 nloc, batch_size, nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg,
-                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max, stream);
+                _seg_off, _ring_base, _ring_size, _ring_weights, _yp, _y_hi, _alpha_sum, _qdotk_max, stream);
             return;
         }
 
@@ -552,7 +584,7 @@ namespace attention_kernels
 
         s2_attn_fwd_ragged_generic_vec_k<THREADS><<<grid, block, shsize, stream>>>(
             nheads, nchans_in, nchans_out, npoints_in, npoints_out, _kxp, _vxp, _qyp, _seg, _seg_off, _ring_base,
-            _ring_size, _ring_weights, _yp, _alpha_sum, _qdotk_max);
+            _ring_size, _ring_weights, _yp, _y_hi, _alpha_sum, _qdotk_max);
         CHECK_ERROR("s2_attn_fwd_ragged_generic_vec_k");
 
         return;
@@ -569,7 +601,7 @@ namespace attention_kernels
     // point) and fp32 whatever the activations are, for the same reason ring_weights
     // is: they are softmax bookkeeping, not activations, and the backward reads them
     // as float unconditionally.
-    std::tuple<at::Tensor, at::Tensor, at::Tensor>
+    std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
     s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
                                  at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
                                  at::Tensor ring_size, int64_t num_heads, int64_t npoints_out)
@@ -637,6 +669,16 @@ namespace attention_kernels
         torch::Tensor alpha_sum = torch::empty(stat_dims, kx.options().dtype(torch::kFloat32));
         torch::Tensor qdotk_max = torch::empty(stat_dims, kx.options().dtype(torch::kFloat32));
 
+        // An fp32 copy of the output, for bf16 only, so the backward can take its
+        // one-pass form there. It costs a second output-sized tensor, which is why it
+        // is not allocated for the dtypes whose stored output is already precise
+        // enough: fp32 trivially, and fp16 because its 11 mantissa bits keep the
+        // cancellation in (gdotv_i - integral) inside tolerance where bf16's 8 do not.
+        // Empty otherwise, and the kernel takes nullptr and skips the store.
+        const bool want_y_hi = (qy.scalar_type() == at::kBFloat16);
+        torch::Tensor y_hi = want_y_hi ? torch::empty(out_dims, kx.options().dtype(torch::kFloat32))
+                                       : torch::empty({0}, kx.options().dtype(torch::kFloat32));
+
         // Activations stay in their native dtype and y is allocated in it, so there is
         // no whole-tensor fp32 copy and the read bandwidth for fp16/bf16 is halved.
         // The kernel widens to fp32 at load and narrows back at store; compute and
@@ -657,6 +699,7 @@ namespace attention_kernels
                 reinterpret_cast<const int64_t *>(ring_size.data_ptr()),
                 reinterpret_cast<const float *>(ring_weights.data_ptr()),
                 reinterpret_cast<storage_t *>(y_nhwc.data_ptr()),
+                want_y_hi ? reinterpret_cast<typename vec_traits<storage_t>::compute_t *>(y_hi.data_ptr()) : nullptr,
                 reinterpret_cast<float *>(alpha_sum.data_ptr()),
                 reinterpret_cast<float *>(qdotk_max.data_ptr()), stream);
 
@@ -667,7 +710,7 @@ namespace attention_kernels
 
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        return std::make_tuple(y, alpha_sum, qdotk_max);
+        return std::make_tuple(y, y_hi, alpha_sum, qdotk_max);
     }
 
     TORCH_LIBRARY_IMPL(attention_kernels, CUDA, m) { m.impl("forward_ragged", &s2_attention_fwd_ragged_cuda); }

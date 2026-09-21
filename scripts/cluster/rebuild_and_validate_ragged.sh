@@ -53,6 +53,10 @@ WORKDIR="${WORKDIR:-torch-harmonics-hpx}"
 # the exact-work FLOPs alone need ~95% of vector peak to match FlexAttention, at 32
 # only ~35%, so the two resolutions answer different questions.
 TIMING_NSIDES="${TIMING_NSIDES:-32 64}"
+# fp32 and bf16 are different kernels, not the same kernel at two widths: the
+# backward's one-pass and two-pass forms are selected by dtype. Timing both is what
+# shows whether bf16 has stopped paying for the second walk.
+TIMING_DTYPES="${TIMING_DTYPES:-float32 bfloat16}"
 CHANNELS="${CHANNELS:-96}"
 NUM_HEADS="${NUM_HEADS:-1}"
 CUTOFF_DEG="${CUTOFF_DEG:-10.0}"
@@ -88,6 +92,13 @@ echo
 # default: setup.py keys its sm90a/sm100a paths off it, and overriding it here would
 # silently change which of those get compiled.
 # ---------------------------------------------------------------------------
+# REBUILD=0 skips it. Only correct when the .so in the tree already matches the
+# sources -- which it does after a run that got past this step and failed later, and
+# the gates are the part worth repeating when the fix was in Python or in a test.
+# Wrong whenever a .cu or a header changed, and wrong silently, so it is opt-in.
+if [[ "${REBUILD:-1}" == "0" ]]; then
+  echo "--- rebuild SKIPPED (REBUILD=0); the .so in the tree is assumed current ---"
+else
 echo "--- rebuilding extension ---"
 run_in_container bash -lc '
 set -euo pipefail
@@ -128,6 +139,7 @@ export MAX_JOBS="${SLURM_CPUS_PER_TASK:-16}"
 echo "MAX_JOBS=${MAX_JOBS}"
 python setup.py build_ext --inplace
 '
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -200,7 +212,7 @@ bench() {
     python -u -m benchmarks.healpix_ragged_report \
       --nsides ${TIMING_NSIDES} \
       --timing-nsides ${TIMING_NSIDES} \
-      --dtypes float32 \
+      --dtypes ${TIMING_DTYPES} \
       --batch 1 \
       --channels "${CHANNELS}" \
       --num-heads "${NUM_HEADS}" \

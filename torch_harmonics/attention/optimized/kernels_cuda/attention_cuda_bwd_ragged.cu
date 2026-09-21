@@ -1225,7 +1225,7 @@ namespace attention_kernels
     // needs integral built from something better than a bf16 output -- an fp32 copy of
     // y is the obvious candidate and costs as much memory as the output itself, so it
     // wants measuring against the 2x it would buy back rather than assuming.
-    static bool ragged_bwd_two_pass(at::ScalarType dtype)
+    static bool ragged_bwd_two_pass(at::ScalarType dtype, bool have_precise_y)
     {
         static const int forced = []() {
             const char *env = std::getenv("TORCH_HARMONICS_RAGGED_BWD_TWO_PASS");
@@ -1233,7 +1233,10 @@ namespace attention_kernels
             return env[0] == '1' ? 1 : 0;
         }();
         if (forced >= 0) { return forced == 1; }
-        return dtype == at::kBFloat16;
+        // bf16 only needs the two walks when integral would have to come from the
+        // bf16 output. Given the fp32 copy the forward now emits for exactly this,
+        // it takes the single walk like every other dtype.
+        return dtype == at::kBFloat16 && !have_precise_y;
     }
 
     template <bool TWO_PASS, typename STORAGE_T>
@@ -1291,9 +1294,10 @@ namespace attention_kernels
                                        const int32_t *_seg_off, const int64_t *_ring_base, const int64_t *_ring_size,
                                        const float *_ring_weights, typename vec_traits<STORAGE_T>::compute_t *_dkxp,
                                        typename vec_traits<STORAGE_T>::compute_t *_dvxp,
-                                       typename vec_traits<STORAGE_T>::compute_t *_dqyp, cudaStream_t stream)
+                                       typename vec_traits<STORAGE_T>::compute_t *_dqyp, bool _have_precise_y,
+                                       cudaStream_t stream)
     {
-        if (ragged_bwd_two_pass(c10::CppTypeToScalarType<STORAGE_T>::value)) {
+        if (ragged_bwd_two_pass(c10::CppTypeToScalarType<STORAGE_T>::value, _have_precise_y)) {
             launch_gen_attn_bwd_ragged<true, STORAGE_T>(batch_size, nheads, nchans_in, nchans_out, npoints_in,
                                                         npoints_out, _kxp, _vxp, _qyp, _dyp, _alpha_sum, _qdotk_max,
                                                         _integral, _seg, _seg_off, _ring_base, _ring_size,
@@ -1316,7 +1320,7 @@ namespace attention_kernels
     // changes when TORCH_HARMONICS_RAGGED_BWD_TWO_PASS selects it.
     std::tuple<at::Tensor, at::Tensor, at::Tensor>
     s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor y,
-                                 at::Tensor alpha_sum, at::Tensor qdotk_max, at::Tensor ring_weights,
+                                 at::Tensor y_hi, at::Tensor alpha_sum, at::Tensor qdotk_max, at::Tensor ring_weights,
                                  at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
                                  at::Tensor ring_size, int64_t num_heads, int64_t npoints_out)
     {
@@ -1415,9 +1419,17 @@ namespace attention_kernels
         // match alpha_sum and qdotk_max, which the transpose is for -- the product is
         // natural in (batch, point, head) and the kernel indexes by batch * nheads +
         // head.
+        //
+        // From y_hi when the forward produced one. Upcasting y here would not help:
+        // the precision was lost when it was stored, and it is precisely the term
+        // that gets subtracted from quantities close to it.
+        const bool have_precise_y = y_hi.defined() && y_hi.numel() > 0;
+        const at::Tensor &y_for_integral = have_precise_y ? y_hi : y;
+
         const int64_t per_head[] = {batch_size, npoints_out, num_heads, nchans_out};
         const int64_t chan_dim = 3;
-        torch::Tensor integral = (dy.reshape(per_head).to(at::kFloat) * y.reshape(per_head).to(at::kFloat))
+        torch::Tensor integral = (dy.reshape(per_head).to(at::kFloat)
+                                  * y_for_integral.reshape(per_head).to(at::kFloat))
                                      .sum(chan_dim)
                                      .transpose(1, 2)
                                      .contiguous();
@@ -1455,7 +1467,7 @@ namespace attention_kernels
                 reinterpret_cast<const int64_t *>(ring_size.data_ptr()),
                 reinterpret_cast<const float *>(ring_weights.data_ptr()),
                 reinterpret_cast<compute_t *>(dkxP.data_ptr()), reinterpret_cast<compute_t *>(dvxP.data_ptr()),
-                reinterpret_cast<compute_t *>(dqyP.data_ptr()), stream);
+                reinterpret_cast<compute_t *>(dqyP.data_ptr()), have_precise_y, stream);
 
             dkx = dkxP;
             dvx = dvxP;

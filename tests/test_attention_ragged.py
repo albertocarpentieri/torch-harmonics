@@ -691,9 +691,10 @@ class TestRaggedForwardCudaKernel(unittest.TestCase):
         vx = torch.randn(shape, device=self.device, dtype=dtype)
         qy = torch.randn(shape, device=self.device, dtype=dtype)
 
-        # the op returns its softmax statistics alongside the output; they exist for the
-        # backward's benefit and are checked for shape and dtype below
-        got, alpha_sum, qdotk_max = torch.ops.attention_kernels.forward_ragged(
+        # the op returns its softmax statistics alongside the output, plus an fp32 copy
+        # of the output in bf16 only; they exist for the backward's benefit and are
+        # checked for shape and dtype below
+        got, y_hi, alpha_sum, qdotk_max = torch.ops.attention_kernels.forward_ragged(
             kx.contiguous(),
             vx.contiguous(),
             qy.contiguous(),
@@ -712,6 +713,18 @@ class TestRaggedForwardCudaKernel(unittest.TestCase):
         # alpha_sum is a sum of positive terms, and every output point has neighbours
         self.assertTrue((alpha_sum > 0).all())
         self.assertTrue(torch.isfinite(qdotk_max).all())
+
+        # y_hi carries the output again at full precision, and only where the backward
+        # needs it: in bf16, whose 8 mantissa bits cannot form integral = dy . out
+        # accurately enough for the single-pass form. Empty for every other dtype, so
+        # they pay nothing. Asserted because "silently absent" and "silently empty"
+        # would both leave bf16 quietly back on two passes.
+        self.assertEqual(y_hi.dtype, torch.float32, "y_hi")
+        if dtype == torch.bfloat16:
+            self.assertEqual(y_hi.shape, got.shape, "y_hi")
+            self.assertTrue(torch.allclose(y_hi.to(dtype), got, atol=0, rtol=0), "y_hi must equal y once narrowed")
+        else:
+            self.assertEqual(y_hi.numel(), 0, "y_hi should be empty except in bf16")
 
         # the reference shares this op's channels-last ABI, so it takes the same
         # tensors; it differs only in consuming the CSR expansion instead of the arcs
@@ -893,7 +906,7 @@ class TestRaggedBackwardCudaKernel(unittest.TestCase):
         npix = grid.npoints
         kx, vx, qy = (torch.randn(1, npix, 8, device=self.device, requires_grad=True) for _ in range(3))
 
-        out, alpha_sum, qdotk_max = _neighborhood_s2_attention_ragged_optimized(
+        out, y_hi, alpha_sum, qdotk_max = _neighborhood_s2_attention_ragged_optimized(
             kx,
             vx,
             qy,
@@ -907,9 +920,12 @@ class TestRaggedBackwardCudaKernel(unittest.TestCase):
         )
 
         # the statistics are the backward's own bookkeeping, so nothing must be able to
-        # route a gradient through them -- see _setup_context_attention_ragged_backward
+        # route a gradient through them -- see _setup_context_attention_ragged_backward.
+        # y_hi is the same for the same reason and one more: it is the output again, so
+        # a gradient through it would be counted twice.
         self.assertFalse(alpha_sum.requires_grad)
         self.assertFalse(qdotk_max.requires_grad)
+        self.assertFalse(y_hi.requires_grad)
 
         out.backward(torch.ones_like(out))
 

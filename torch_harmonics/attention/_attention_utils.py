@@ -114,15 +114,18 @@ def _setup_context_attention_ragged_backward(ctx, inputs, output):
     # what lets the backward walk each neighbourhood once: y gives it dy . out, and
     # alpha_sum / qdotk_max are what the discarded first walk existed to rebuild.
     kw, vw, qw, ring_weights, seg, seg_off, ring_base, ring_size, nh, npoints_out = inputs
-    y, alpha_sum, qdotk_max = output
-    ctx.save_for_backward(seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw, y, alpha_sum, qdotk_max)
+    y, y_hi, alpha_sum, qdotk_max = output
+    ctx.save_for_backward(
+        seg, seg_off, ring_base, ring_size, ring_weights, kw, vw, qw, y, y_hi, alpha_sum, qdotk_max
+    )
     ctx.nh = nh
     ctx.npoints_out = npoints_out
 
-    # Softmax bookkeeping, not a quantity anyone differentiates. Marking them keeps a
+    # Softmax bookkeeping, not quantities anyone differentiates -- and y_hi is the same
+    # output again, so a gradient through it would double count. Marking them keeps a
     # caller that touches them from silently getting the gradient of y instead, since
-    # the backward can only honour one of the three grads it is handed.
-    ctx.mark_non_differentiable(alpha_sum, qdotk_max)
+    # the backward can only honour one of the four grads it is handed.
+    ctx.mark_non_differentiable(y_hi, alpha_sum, qdotk_max)
 
 
 def _build_psi_segments(col_idx: torch.Tensor, roff_idx: torch.Tensor, nlon: int):

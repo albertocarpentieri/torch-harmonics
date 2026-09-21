@@ -59,10 +59,12 @@ namespace attention_kernels
     // flat point axis, and the neighbourhood keyed per output point rather than per
     // output latitude -- see attention_cuda_fwd_ragged.cu.
     //
-    // Returns (y, alpha_sum, qdotk_max): the softmax statistics are saved per
+    // Returns (y, y_hi, alpha_sum, qdotk_max): the softmax statistics are saved per
     // (batch, head, point) so the backward can walk each neighbourhood once instead of
-    // twice.
-    std::tuple<at::Tensor, at::Tensor, at::Tensor>
+    // twice, and y_hi is an fp32 copy of the output that exists only for bf16, where
+    // the stored output is too coarse to form integral = dy . out accurately enough
+    // for that single walk. Empty for every other dtype.
+    std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
     s2_attention_fwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor ring_weights,
                                  at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
                                  at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
@@ -71,6 +73,7 @@ namespace attention_kernels
     // attention_cuda_bwd_ragged.cu.
     std::tuple<at::Tensor, at::Tensor, at::Tensor>
     s2_attention_bwd_ragged_cuda(at::Tensor kx, at::Tensor vx, at::Tensor qy, at::Tensor dy, at::Tensor y,
+                                 at::Tensor y_hi,
                                  at::Tensor alpha_sum, at::Tensor qdotk_max, at::Tensor ring_weights,
                                  at::Tensor psi_seg, at::Tensor psi_seg_off, at::Tensor ring_base,
                                  at::Tensor ring_size, int64_t num_heads, int64_t npoints_out);
