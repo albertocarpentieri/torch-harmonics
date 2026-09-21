@@ -1,31 +1,48 @@
 #!/usr/bin/env bash
 # Provisioning steps that run *inside* the container, invoked by
-# build_healpix_container.sh. Kept as its own file rather than inlined into the srun
-# command line so that the python snippets below can use quotes freely; nesting them
-# in a quoted `bash -lc` string silently strips them.
+# build_healpix_container.sh. Kept as its own file rather than inlined into the
+# enroot command line so that the python snippets below can use quotes freely;
+# nesting them in a quoted `bash -lc` string silently strips them.
 #
-# Expects the project mounted at /workspace.
+# Expects the project mounted at /workspace and the vendored wheels in /tmp.
+#
+# The base is a stock NGC PyTorch image, which carries torch and the CUDA toolchain
+# and nothing else this needs. That is the whole point of choosing it: the kernel
+# work depends on torch, pytest and the checkout, and on nothing in the healda or
+# earth2studio stack. tests/test_attention_ragged.py imports torch, parameterized,
+# attention_helpers and torch_harmonics; the one test that wants earth2grid calls
+# skipTest when it is absent. So earth2grid and healda are deliberately NOT
+# installed here -- the FlexAttention comparison in §8 needs them and should get
+# its own image or its own install step, rather than making every kernel run carry
+# a stack it does not use.
 
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
+
+# PIP_CONSTRAINT is baked into the NGC images and would fight the installs below.
+unset PIP_CONSTRAINT CONDA_PREFIX
 
 echo "=== base image inventory ==="
 python -c "import sys; print('python', sys.version)"
 python - <<'PY'
 import importlib.metadata as md
 
-for name in ["torch", "earth2grid", "earth2studio", "nvidia-physicsnemo", "torch-harmonics", "transformer-engine", "numba", "zarr"]:
+for name in ["torch", "numpy", "pytest", "parameterized", "torch-harmonics"]:
     try:
         print(f"  {name}: {md.version(name)}")
     except md.PackageNotFoundError:
         print(f"  {name}: MISSING")
 PY
+python -c "import torch; print('  torch cuda', torch.version.cuda)"
+nvcc --version | tail -2 | head -1
 
-python -m pip install --no-cache-dir --upgrade pip setuptools wheel
-
-echo "=== earth2grid (git-only, not on PyPI) ==="
-python -m pip install --no-cache-dir "earth2grid @ https://github.com/NVlabs/earth2grid/archive/main.tar.gz"
+echo "=== test dependencies, from the vendored wheels ==="
+# --no-index so the build needs no outbound network at all, which is what lets it
+# run on a compute node. The wheels were resolved on this same base image, so the
+# set is complete and the one binary wheel among them (cachebox) is aarch64.
+python -m pip install --no-cache-dir --no-index --find-links /tmp/wheels \
+    pytest pytest-regtest parameterized
 
 echo "=== torch-harmonics from the local HEALPix branch ==="
 # Drop anything a previous build left behind. The tree is bind-mounted, so build
@@ -38,7 +55,7 @@ find "${WORKSPACE}/torch-harmonics-hpx" -name "*.so" -delete
 
 # setup.py decides between CUDAExtension and CppExtension with
 #   BUILD_CUDA = TORCH_HARMONICS_BUILD_CUDA_EXTENSION or (torch.cuda.is_available() and CUDA_HOME)
-# and this build step runs on a CPU node, so the autodetect arm is always False.
+# and this build step runs without a GPU, so the autodetect arm is always False.
 # The variable name has to match exactly: an unrecognised one (this script used to
 # pass FORCE_CUDA_EXTENSION) leaves BUILD_CUDA False, and the build then succeeds
 # while quietly producing CPU-only extensions -- every op still gets declared by
@@ -48,14 +65,16 @@ find "${WORKSPACE}/torch-harmonics-hpx" -name "*.so" -delete
 #
 # TORCH_CUDA_ARCH_LIST is required for the same reason: with no GPU present nvcc has
 # nothing to autodetect and would target the toolkit default, so the kernels would
-# not load on the test nodes. 10.0a covers GB200, 10.3a covers the GB300 the tests
-# have been landing on.
+# not load on the test nodes. 10.0a covers GB200, 10.3a covers GB300. It is taken
+# from the environment so it can be corrected without editing this file -- a wrong
+# value here builds cleanly and then fails to load at test time.
 #
-# --no-build-isolation so the extension links against the torch already in the image
-# instead of a second copy pip would resolve.
+# --no-build-isolation so the extension links against the torch already in the
+# image instead of a second copy pip would resolve, and --no-deps so pip cannot
+# resolve a different torch over the one it is compiling against.
 TORCH_HARMONICS_BUILD_CUDA_EXTENSION=1 \
-TORCH_CUDA_ARCH_LIST="10.0a 10.3a" \
-    python -m pip install -v --no-cache-dir --no-build-isolation -e "${WORKSPACE}/torch-harmonics-hpx"
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0a 10.3a}" \
+    python -m pip install -v --no-cache-dir --no-build-isolation --no-deps -e "${WORKSPACE}/torch-harmonics-hpx"
 
 echo "=== which attention CUDA sources were compiled ==="
 python - <<'PY'
@@ -69,32 +88,26 @@ for m in re.finditer(r'"(torch_harmonics/attention/optimized/kernels_cuda/[^"]+\
     print("  listed:", m.group(1))
 PY
 
-echo "=== healda and its remaining dependencies ==="
-python -m pip install --no-cache-dir -e "${WORKSPACE}/healda"
-python -m pip install --no-cache-dir pytest pytest-regtest parameterized
-
 echo "=== verification ==="
 python - <<'PY'
+import pathlib
+
 import torch
-import earth2grid
-from earth2grid import healpix
 
 import torch_harmonics as th
 
 print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("earth2grid", getattr(earth2grid, "__version__", "n/a"))
 print("torch_harmonics", th.__version__)
+print("torch_harmonics from", th.__file__)
 print("grid types", th.grid_types())
 
-grid = healpix.Grid(6, pixel_order=healpix.PixelOrder.RING)
-print("earth2grid healpix level 6 shape", grid.shape)
+# The editable install has to resolve to the mounted tree, or every later run
+# silently measures the stock package instead of the kernels just compiled.
+if not th.__file__.startswith("/workspace/"):
+    raise SystemExit(f"ERROR: torch_harmonics resolved to {th.__file__}, not the mounted tree")
 
 hpx = th.HealpixGrid(nside=64)
 print("HealpixGrid(nside=64):", hpx.npoints, "pixels on", hpx.nlat, "rings")
-
-import healda
-
-print("healda", getattr(healda, "__version__", "n/a"))
 
 from torch_harmonics.attention import optimized_kernels_is_available as attention_kernels
 from torch_harmonics.disco import optimized_kernels_is_available as disco_kernels

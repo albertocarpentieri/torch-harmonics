@@ -18,7 +18,7 @@
 set -uo pipefail
 
 PROJECT="/home/acarpentieri/healda_project"
-CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/acarpentieri/healda_project/containers/healpix_container.sqsh}"
+CONTAINER="${CONTAINER:-${PROJECT}/containers/healpix_container.sqsh}"
 OUT="${OUT:-${PROJECT}/logs/verify}"
 ARCHES="${ARCHES:-sm_90a sm_100a}"
 FILES="${FILES:-attention_cuda_fwd_ragged attention_cuda_bwd_ragged}"
@@ -26,8 +26,14 @@ FILES="${FILES:-attention_cuda_fwd_ragged attention_cuda_bwd_ragged}"
 mkdir -p "${OUT}"
 rm -f "${OUT}"/*.log "${OUT}"/*.o
 
+# logs/ is a symlink into Lustre on some clusters, so the mount has to follow it or
+# ${OUT} dangles inside the container and every compile fails on a missing log path.
+# rebuild_and_validate_ragged.sh mounts /lustre for the same reason.
+MOUNTS=(--mount "${PROJECT}:/workspace")
+[[ -d /lustre ]] && MOUNTS+=(--mount /lustre:/lustre)
+
 NVIDIA_VISIBLE_DEVICES=void enroot start \
-  --mount "${PROJECT}:/workspace" \
+  "${MOUNTS[@]}" \
   --env "ARCHES=${ARCHES}" --env "FILES=${FILES}" \
   "${CONTAINER}" bash -lc '
 set -uo pipefail

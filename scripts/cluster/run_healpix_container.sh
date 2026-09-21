@@ -10,7 +10,7 @@
 set -euo pipefail
 
 PROJECT="/home/acarpentieri/healda_project"
-CONTAINER="/lustre/fsw/portfolios/coreai/users/acarpentieri/healda_project/containers/healpix_container.sqsh"
+CONTAINER="${CONTAINER:-${PROJECT}/containers/healpix_container.sqsh}"
 WORKDIR="${WORKDIR:-/workspace/torch-harmonics-hpx}"
 
 [[ -f "${CONTAINER}" ]] || {
@@ -19,12 +19,15 @@ WORKDIR="${WORKDIR:-/workspace/torch-harmonics-hpx}"
 }
 
 if [[ "${GPU:-0}" == "1" ]]; then
-  alloc=(-p batch -q interactive -N1 --gpus "${GPUS:-1}")
+  # Four GPUs, not one: the QOS rejects a single-GPU request with QOSMinGRES. The
+  # work is single-process and only ever touches cuda:0.
+  alloc=(-p batch -N1 --gpus-per-node "${GPUS:-4}")
 else
+  # cpu-normal is the QOS build_container.sh uses for the cpu partition here.
   alloc=(-p cpu -q cpu-normal -N1 --cpus-per-task "${CPUS:-16}")
 fi
 
-exec srun -A coreai_climate_earth2 "${alloc[@]}" \
+exec srun -A coreai_devtech_all "${alloc[@]}" \
   --time "${TIME:-01:00:00}" \
   --container-image="${CONTAINER}" \
   --container-mounts=/lustre:/lustre,"${PROJECT}":/workspace \

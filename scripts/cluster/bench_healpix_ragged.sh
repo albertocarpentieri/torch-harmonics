@@ -13,12 +13,12 @@
 # enforces a minimum GRES count and rejects a single-GPU request with QOSMinGRES.
 # The benchmark is single-process and only ever touches cuda:0.
 #SBATCH --job-name=bench-healpix-ragged
-#SBATCH --account=coreai_climate_earth2
+#SBATCH --account=coreai_devtech_all
 #SBATCH --partition=batch
-#SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
+# Per-node, not job-scoped: the cli_filter here rejects --gpus/-G.
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
 # The torch reference is the slow half and the equiangular arm doubles the
 # configurations; 30 minutes was not enough to finish even one table.
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 PROJECT="/home/acarpentieri/healda_project"
-CONTAINER="/lustre/fsw/portfolios/coreai/users/acarpentieri/healda_project/containers/healpix_container.sqsh"
+CONTAINER="${CONTAINER:-${PROJECT}/containers/healpix_container.sqsh}"
 
 WORKDIR="${WORKDIR:-torch-harmonics-hpx}"
 
@@ -66,6 +66,7 @@ srun --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}" \
   --container-image="${CONTAINER}" \
   --container-mounts=/lustre:/lustre,"${PROJECT}":/workspace \
   --container-workdir="/workspace/${WORKDIR}" \
+  env "PYTHONPATH=/workspace/${WORKDIR}" \
   python -c '
 import torch
 
@@ -92,6 +93,7 @@ srun --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}" \
   --container-image="${CONTAINER}" \
   --container-mounts=/lustre:/lustre,"${PROJECT}":/workspace \
   --container-workdir="/workspace/${WORKDIR}" \
+  env "PYTHONPATH=/workspace/${WORKDIR}" \
   python -u -m benchmarks.healpix_ragged_report \
     --nsides ${NSIDES} \
     --timing-nsides ${TIMING_NSIDES} \

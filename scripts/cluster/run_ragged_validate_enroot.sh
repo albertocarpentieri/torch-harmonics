@@ -22,7 +22,7 @@
 set -uo pipefail
 
 PROJECT="/home/acarpentieri/healda_project"
-CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/acarpentieri/healda_project/containers/healpix_container.sqsh}"
+CONTAINER="${CONTAINER:-${PROJECT}/containers/healpix_container.sqsh}"
 WORKDIR="${WORKDIR:-torch-harmonics-hpx}"
 
 TIMING_NSIDES="${TIMING_NSIDES:-32 64}"

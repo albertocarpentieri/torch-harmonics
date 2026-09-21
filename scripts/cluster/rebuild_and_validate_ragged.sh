@@ -22,12 +22,13 @@
 # gpu:4 rather than gpu:1 because the QOS rejects a single-GPU request with
 # QOSMinGRES; the work is single-process and only touches cuda:0.
 #SBATCH --job-name=ragged-rebuild-validate
-#SBATCH --account=coreai_climate_earth2
+#SBATCH --account=coreai_devtech_all
 #SBATCH --partition=batch
-#SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
+# Per-node, not job-scoped: this cluster's cli_filter rejects --gpus/-G under an
+# "NVL72 interim safety policy" and asks for --gpus-per-node instead.
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
 # The rebuild dominates: the special kernel is templated over NLOC 1..16 for each of
 # three dtypes, so nvcc has ~48 new instantiations to chew through.
@@ -38,7 +39,12 @@
 set -euo pipefail
 
 PROJECT="/home/acarpentieri/healda_project"
-CONTAINER="/lustre/fsw/portfolios/coreai/users/acarpentieri/healda_project/containers/healpix_container.sqsh"
+# A dedicated image, deliberately not the aga-* one the rest of healda runs on: this
+# one carries torch-harmonics installed editable against the mounted tree, and the
+# kernel work rebuilds that install constantly. Built by build_healpix_container.sh.
+# containers/ is symlinked into the project root, so this path works from either
+# side of the NFS/Lustre split and does not name the portfolio layout.
+CONTAINER="${CONTAINER:-${PROJECT}/containers/healpix_container.sqsh}"
 WORKDIR="${WORKDIR:-torch-harmonics-hpx}"
 
 # Benchmark shape: healda's dit-5B runs 96 channels per head at nside 64 with a 10
@@ -56,12 +62,18 @@ WARMUP="${WARMUP:-5}"
 [[ -f "${CONTAINER}" ]] || { echo "ERROR: missing ${CONTAINER}" >&2; exit 2; }
 mkdir -p "${PROJECT}/logs"
 
+# PYTHONPATH belts the editable install's braces. The image is built with
+# torch-harmonics editable against /workspace/torch-harmonics-hpx, so an import
+# should already resolve there -- but if it ever does not, it falls back to whatever
+# torch_harmonics is in site-packages and the whole job silently measures upstream's
+# kernels instead of the rebuilt ones. Naming the tree explicitly costs nothing and
+# removes that failure mode; the provenance check below is what actually enforces it.
 run_in_container() {
   srun --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}" \
     --container-image="${CONTAINER}" \
     --container-mounts=/lustre:/lustre,"${PROJECT}":/workspace \
     --container-workdir="/workspace/${WORKDIR}" \
-    "$@"
+    env "PYTHONPATH=/workspace/${WORKDIR}" "$@"
 }
 
 echo "=== job ${SLURM_JOB_ID:-?} | rebuild + validate ragged attention ==="
@@ -79,7 +91,21 @@ echo
 echo "--- rebuilding extension ---"
 run_in_container bash -lc '
 set -euo pipefail
-echo "arch list: ${TORCH_CUDA_ARCH_LIST:-<image default>}"
+
+# Pin the arch list rather than inheriting the image default, which is the
+# opposite of what this script used to do and for a concrete reason.
+#
+# This NGC base ships TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0 10.0 11.0 12.0+PTX".
+# Inheriting it would compile six architectures instead of the two the cluster
+# has -- most of the rebuild time, for nothing -- and would also set
+# BUILD_KPACKED_SM100=0, because setup.py tests for "10.0a"/"10.3a" and that list
+# says plain "10.0". That is the discrepancy recorded in the handover.
+#
+# It must also match how the container was built, or the gates would be testing a
+# differently-configured build than the image was verified with.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST_OVERRIDE:-10.0a 10.3a}"
+
+echo "arch list: ${TORCH_CUDA_ARCH_LIST}"
 echo "nvcc append: ${NVCC_APPEND_FLAGS:-<none>}"
 
 # From scratch. An incremental build here is not worth the risk: the .so in the
@@ -101,6 +127,37 @@ rm -rf build
 export MAX_JOBS="${SLURM_CPUS_PER_TASK:-16}"
 echo "MAX_JOBS=${MAX_JOBS}"
 python setup.py build_ext --inplace
+'
+echo
+
+# ---------------------------------------------------------------------------
+# 1b. Prove the rebuild is what gets imported.
+#
+# Everything below is meaningless if torch_harmonics resolves to the stock package
+# in site-packages: the gates would pass and the timings would describe upstream's
+# kernels, with nothing in the output to say so. Check provenance and the CUDA
+# registration before spending two hours on numbers.
+# ---------------------------------------------------------------------------
+echo "--- import provenance ---"
+run_in_container python -c '
+import pathlib, sys
+import torch_harmonics as th
+
+path = pathlib.Path(th.__file__).resolve()
+print("torch_harmonics:", path, th.__version__)
+if not str(path).startswith("/workspace/"):
+    sys.exit("FATAL: torch_harmonics came from outside the mounted tree; "
+             "the rebuilt kernels are not what would be tested")
+
+import torch
+for name in ("forward_ragged", "backward_ragged"):
+    getattr(torch.ops.attention_kernels, name)
+    keys = torch._C._dispatch_dump(f"attention_kernels::{name}")
+    has_cuda = "CUDA" in {ln.split(":")[0].strip() for ln in keys.splitlines() if ":" in ln}
+    print(f"attention_kernels::{name}: CUDA={has_cuda}")
+    if not has_cuda:
+        sys.exit(f"FATAL: {name} has no CUDA kernel registered")
+print("ok: mounted tree, both ragged ops registered for CUDA")
 '
 echo
 
