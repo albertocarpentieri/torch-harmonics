@@ -118,15 +118,20 @@ if optimized_kernels_is_available():
             ring_size: torch.Tensor,
             num_heads: int,
             npoints_out: int,
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             # NHWC with the spatial axes flattened: (B, npoints_out, num_heads * C_v).
             # The channel extent comes from vw, which already carries the packed width.
             out_shape = (kw.shape[0], npoints_out, vw.shape[2])
             # The softmax statistics are per (batch, head, point) and float32 whatever
             # the activations are, so the backward can read them as float unconditionally.
             stat_shape = (kw.shape[0], num_heads, npoints_out)
+            # y_hi is the output again in fp32, for bf16 only, and empty otherwise --
+            # see the schema. The shape has to match the CUDA side exactly or tracing
+            # and execution disagree about a tensor the backward then reads.
+            hi_shape = out_shape if kw.dtype == torch.bfloat16 else (0,)
             return (
                 torch.empty(out_shape, dtype=kw.dtype, device=kw.device),
+                torch.empty(hi_shape, dtype=torch.float32, device=kw.device),
                 torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
                 torch.empty(stat_shape, dtype=torch.float32, device=kw.device),
             )
@@ -141,6 +146,7 @@ if optimized_kernels_is_available():
             qw: torch.Tensor,
             dy: torch.Tensor,
             y: torch.Tensor,
+            y_hi: torch.Tensor,
             alpha_sum: torch.Tensor,
             qdotk_max: torch.Tensor,
             ring_weights: torch.Tensor,

@@ -895,6 +895,40 @@ class TestRaggedBackwardCudaKernel(unittest.TestCase):
         self.assertTrue(torch.isfinite(out_cuda).all())
         self.assertTrue(compare_tensors("cpu vs cuda forward", out_cuda.cpu(), out, atol=1e-4, rtol=1e-4))
 
+    def test_the_op_survives_torch_compile(self):
+        """
+        A fake whose signature has drifted from its schema is invisible until
+        something traces the graph.
+
+        Eager execution calls the CUDA implementation directly and never consults a
+        fake, so a stale one passes every other test here. Only tracing reads them,
+        and only tracing a *backward* reads the backward's -- which is how
+        `backward_ragged` came to be traced with one argument more than its fake
+        accepted, after y_hi was added to its schema. Every gate in
+        rebuild_and_validate_ragged.sh passed on that build; the first thing to
+        notice was a benchmark whose compiled column had quietly gone empty.
+
+        So this compiles a forward and a backward, which is the cheapest thing that
+        reads both fakes, and asserts the gradients arrive. It is a registration
+        test, not a numerics test -- the accuracy of the compiled path is the same
+        kernel the other tests already check.
+        """
+        grid = HealpixGrid(nside=4)
+        layer = NeighborhoodAttentionS2(
+            in_channels=8, num_heads=2, grid_in=grid, grid_out=grid
+        ).to(self.device)
+
+        # channels-first, which is the layer's ABI. The raw op takes the transpose --
+        # (batch, npoints, packed channels) -- and mixing the two up gets caught by a
+        # shape check naming the point count, which reads like a channel error.
+        x = torch.randn(1, 8, grid.npoints, device=self.device, requires_grad=True)
+
+        compiled = torch.compile(layer, dynamic=False)
+        compiled(x, x, x).sum().backward()
+
+        self.assertIsNotNone(x.grad, "no gradient came back through the compiled op")
+        self.assertTrue(torch.isfinite(x.grad).all(), "compiled backward produced non-finite gradients")
+
     def test_dk_and_dv_accumulate_over_overlapping_neighborhoods(self):
         # dk/dv are scatter-accumulated with atomicAdd because neighbourhoods overlap.
         # If the buffers were allocated with empty() instead of zeros(), or a
