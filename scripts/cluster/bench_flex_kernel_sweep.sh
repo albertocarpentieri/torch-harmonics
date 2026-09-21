@@ -47,6 +47,14 @@ BT="${BT:-2}"
 BLOCK="${BLOCK:-128}"
 ITERS="${ITERS:-20}"
 WARMUP="${WARMUP:-5}"
+# bf16 is what training uses and is where the ragged backward takes its two-pass
+# path; fp32 takes the single-pass one. The two are not the same kernel, so the
+# comparison against flex is a different question in each.
+DTYPE="${DTYPE:-bf16}"
+# Every (grid, radius) is a new shape and each burns one recompile against a
+# default budget of 8, so a twelve-row sweep silently drops both arms to eager
+# partway through. Sized to the sweep, not left at the default.
+RECOMPILE_LIMIT="${RECOMPILE_LIMIT:-64}"
 
 [[ -f "${CONTAINER}" ]] || { echo "ERROR: missing ${CONTAINER}; run derive_earth2grid_container.sh first" >&2; exit 2; }
 [[ -d "${PROJECT}/${WORKDIR}" ]] || { echo "ERROR: missing ${PROJECT}/${WORKDIR}" >&2; exit 2; }
@@ -63,6 +71,7 @@ run_in_container() {
 
 echo "=== job ${SLURM_JOB_ID:-?} | flex vs ragged kernel configurations ==="
 echo "    grids=${GRIDS}  radii=${RADII}  channels=${CHANNELS} heads=${HEADS} bt=${BT}"
+echo "    dtype=${DTYPE}  recompile_limit=${RECOMPILE_LIMIT}  arms=${ARMS}"
 echo ">> harmonics rev: $(git -C "${PROJECT}/torch-harmonics-hpx" rev-parse --short HEAD)"
 echo ">> bench rev:     $(git -C "${PROJECT}/${WORKDIR}" rev-parse --short HEAD)"
 echo
@@ -119,7 +128,9 @@ arm() {
       --bt "${BT}" \
       --block-size "${BLOCK}" \
       --iters "${ITERS}" \
-      --warmup "${WARMUP}"
+      --warmup "${WARMUP}" \
+      --dtype "${DTYPE}" \
+      --recompile-limit "${RECOMPILE_LIMIT}"
   echo
 }
 
