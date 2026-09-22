@@ -379,6 +379,23 @@ namespace attention_kernels
             for (; j + NB <= len; j += NB) {
 
                 // addresses first, so the NB loads that follow have nothing to wait on
+                //
+                // The two 64-bit multiplies per neighbour look like an obvious target:
+                // col advances by one and wraps at most once per arc, which is what
+                // the arc encoding is for, so they could be one add each with the
+                // multiply hoisted to the arc. Tried, and it loses. Carrying the
+                // running pointers costs registers -- NLOC=3 BFloat16 goes from 56 to
+                // 72 and occupancy from 56% to 44%, or 64 and 50% if the wrap targets
+                // are held instead, which makes fp32 spill. Measured at nside 64 the
+                // forward went 1.363 -> 1.522 ms in bf16 and 1.266 -> 1.430 in fp32,
+                // so the lost occupancy outweighs the saved integer work by about 12%.
+                //
+                // This is the same trade e9092eb found cancelling out, and it says the
+                // kernel is not short of issue slots so much as short of warps. The
+                // version that might still pay is splitting each arc at its seam into
+                // two runs, so the inner loop is a pure increment with no wrap test and
+                // no extra live pointers -- that needs the NB grouping to respect the
+                // run boundary, which is why it was not the first thing tried.
                 const STORAGE_T *kp[NB];
                 const STORAGE_T *vp[NB];
 #pragma unroll
