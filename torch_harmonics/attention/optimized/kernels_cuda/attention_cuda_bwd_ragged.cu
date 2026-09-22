@@ -1151,6 +1151,185 @@ namespace attention_kernels
     }
 
     // Resolve NLOC, which has to be a compile-time constant, from the runtime channel
+    // dk and dv by gather instead of scatter, for grid_in == grid_out.
+    // ------------------------------------------------------------------
+    // The scatter form is already minimal in its own orientation: loc_qy and loc_dy
+    // are loop-invariant, so every one of a query's neighbours receives a scaled copy
+    // of one register-resident vector, coalesced across lanes. What it costs is the
+    // atomics -- one add per channel per neighbour, 1.24e11 of them per layer at
+    // nside 64, and after the single-pass change they are what binds: the backward
+    // moves 23.2e9 L2 reduction sectors, about 496 GB against 248 GB of reads, and
+    // runs at 85.7% memory throughput with L2 at 71%.
+    //
+    // Turning it round removes them entirely. Fix an input point j and accumulate
+    //
+    //   dk[j] = sum_{i in N(j)} p_i(j) (gdotv_i(j) - integral_i) q_i
+    //   dv[j] = sum_{i in N(j)} p_i(j) dy_i
+    //
+    // in registers, then store once. The arithmetic is the same -- both forms
+    // recompute q.k and dy.v per pair -- so this trades 496 GB of atomic writes for
+    // 248 GB of q/dy reads and a plain store.
+    //
+    // It works because the neighbourhood is symmetric, so N(j) is j's own arc list
+    // read as queries rather than as neighbours. That is a property of the computed
+    // pattern and not of the continuous geometry, since the arc endpoints come from a
+    // ceil and a floor: measured, zero one-directional entries over 20,181,696 pairs
+    // at nside 64 and over the smaller grids too. It also requires the two grids to be
+    // the same one; for a mixed pair j in N(i) does not imply i in N(j), and the
+    // launcher keeps the scatter for that case.
+    //
+    // Two things fall out of the orientation. The quadrature weight is keyed by the
+    // input ring, which is j's own here, so it leaves the arc loop and becomes a
+    // constant -- hence point_ring, which the wrapper builds once. And dqy still wants
+    // the query orientation, so it stays in the scatter kernel and this runs as a
+    // second launch.
+    //
+    // Neighbour grouping is deliberately absent for now: it is what hides the
+    // dependency chain through the two warp reductions, and adding it at the same time
+    // as a new formulation would make a correctness failure and a performance failure
+    // look alike.
+    template <int BDIM_X, int BDIM_Y, int NLOC, typename STORAGE_T>
+    __global__ __launch_bounds__(BDIM_X *BDIM_Y) void s2_attn_bwd_ragged_gather_kv(
+        int nheads, int nchan_in, int nchan_out, int64_t npoints,
+        const STORAGE_T *__restrict__ kx, const STORAGE_T *__restrict__ vx,
+        const STORAGE_T *__restrict__ qy, const STORAGE_T *__restrict__ dy,
+        const float *__restrict__ alpha_sum_in, const float *__restrict__ qdotk_max_in,
+        const float *__restrict__ integral_in, const int32_t *__restrict__ seg,
+        const int32_t *__restrict__ seg_off, const int64_t *__restrict__ ring_base,
+        const int64_t *__restrict__ ring_size, const float *__restrict__ ring_weights,
+        const int32_t *__restrict__ point_ring,
+        typename vec_traits<STORAGE_T>::compute_t *__restrict__ dkx,
+        typename vec_traits<STORAGE_T>::compute_t *__restrict__ dvx)
+    {
+        using COMPUTE_T = typename vec_traits<STORAGE_T>::compute_t;
+
+        static_assert(BDIM_X == WARP_SIZE, "the gather kernel reduces with __warp_sum");
+        static_assert(NLOC >= 1);
+
+        constexpr int NLOC_M1 = NLOC - 1;
+
+        const int tidx = threadIdx.x;
+
+        const int bh = blockIdx.y;
+        const int batch = bh / nheads;
+        const int head = bh - (batch * nheads);
+
+        const int64_t ldi = int64_t(nheads) * nchan_in;
+        const int64_t ldo = int64_t(nheads) * nchan_out;
+
+        const int64_t jpoint = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
+
+        if (jpoint >= npoints) { return; }
+
+        // k_j and v_j are what stays put here, where qy and dy do in the scatter form
+        COMPUTE_T loc_k[NLOC];
+        COMPUTE_T loc_v[NLOC];
+        COMPUTE_T acc_dk[NLOC];
+        COMPUTE_T acc_dv[NLOC];
+#pragma unroll
+        for (int i = 0; i < NLOC; i++) {
+            loc_k[i] = __vset<COMPUTE_T>(0.0f);
+            loc_v[i] = __vset<COMPUTE_T>(0.0f);
+            acc_dk[i] = __vset<COMPUTE_T>(0.0f);
+            acc_dv[i] = __vset<COMPUTE_T>(0.0f);
+        }
+
+        // the lane's channel offset folded in, as elsewhere. qy and dy keep their
+        // point stride because they are indexed per neighbour.
+        const STORAGE_T *kxj = kx + int64_t(batch) * npoints * ldi + int64_t(head) * nchan_in + jpoint * ldi + tidx;
+        const STORAGE_T *vxj = vx + int64_t(batch) * npoints * ldo + int64_t(head) * nchan_out + jpoint * ldo + tidx;
+        qy += int64_t(batch) * npoints * ldi + int64_t(head) * nchan_in + tidx;
+        dy += int64_t(batch) * npoints * ldo + int64_t(head) * nchan_out + tidx;
+        dkx += int64_t(batch) * npoints * ldi + int64_t(head) * nchan_in + jpoint * ldi + tidx;
+        dvx += int64_t(batch) * npoints * ldo + int64_t(head) * nchan_out + jpoint * ldo + tidx;
+
+#pragma unroll
+        for (int i = 0; i < NLOC_M1; i++) { loc_k[i] = vload(kxj, i * BDIM_X); }
+        if (NLOC_M1 * BDIM_X + tidx < nchan_in) { loc_k[NLOC_M1] = vload(kxj, NLOC_M1 * BDIM_X); }
+#pragma unroll
+        for (int i = 0; i < NLOC_M1; i++) { loc_v[i] = vload(vxj, i * BDIM_X); }
+        if (NLOC_M1 * BDIM_X + tidx < nchan_out) { loc_v[NLOC_M1] = vload(vxj, NLOC_M1 * BDIM_X); }
+
+        // constant for the whole walk, which it is not in the other orientation
+        const float qw = ring_weights[point_ring[jpoint]];
+
+        const int64_t stat_off = int64_t(bh) * npoints;
+
+        const int seg_beg = seg_off[jpoint];
+        const int seg_end = seg_off[jpoint + 1];
+
+        for (int sg = seg_beg; sg < seg_end; sg++) {
+
+            const int iring = seg[3 * sg + 0];
+            const int lo = seg[3 * sg + 1];
+            const int len = seg[3 * sg + 2];
+
+            const int64_t ring_lo = ring_base[iring];
+            const int64_t ring_hi = ring_lo + ring_size[iring];
+
+            int64_t col = ring_lo + lo;
+
+            for (int t = 0; t < len; t++) {
+
+                // col is a query that attends to j
+                const STORAGE_T *qp = qy + col * ldi;
+                const STORAGE_T *dp = dy + col * ldo;
+
+                COMPUTE_T qk = __vset<COMPUTE_T>(0.0f);
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) { qk = __vadd(qk, __vmul(loc_k[i], vload(qp, i * BDIM_X))); }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    qk = __vadd(qk, __vmul(loc_k[NLOC_M1], vload(qp, NLOC_M1 * BDIM_X)));
+                }
+                const float qdotk = __warp_sum(__vred(qk));
+
+                COMPUTE_T gv = __vset<COMPUTE_T>(0.0f);
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) { gv = __vadd(gv, __vmul(loc_v[i], vload(dp, i * BDIM_X))); }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                    gv = __vadd(gv, __vmul(loc_v[NLOC_M1], vload(dp, NLOC_M1 * BDIM_X)));
+                }
+                const float gdotv = __warp_sum(__vred(gv));
+
+                // the query's own softmax state, which is why the forward returns it
+                const int64_t ist = stat_off + col;
+                const float alpha = expf(qdotk - qdotk_max_in[ist]) * qw;
+                const float p = alpha / alpha_sum_in[ist];
+
+                const float s_k = p * (gdotv - integral_in[ist]);
+                const float s_v = p;
+
+                // re-read rather than stage: the values are in L1 from the reductions
+                // above, and registers are what this kernel family runs short of
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    acc_dk[i] = __vadd(acc_dk[i], __vscale(s_k, vload(qp, i * BDIM_X)));
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_in) {
+                    acc_dk[NLOC_M1] = __vadd(acc_dk[NLOC_M1], __vscale(s_k, vload(qp, NLOC_M1 * BDIM_X)));
+                }
+#pragma unroll
+                for (int i = 0; i < NLOC_M1; i++) {
+                    acc_dv[i] = __vadd(acc_dv[i], __vscale(s_v, vload(dp, i * BDIM_X)));
+                }
+                if (NLOC_M1 * BDIM_X + tidx < nchan_out) {
+                    acc_dv[NLOC_M1] = __vadd(acc_dv[NLOC_M1], __vscale(s_v, vload(dp, NLOC_M1 * BDIM_X)));
+                }
+
+                if (++col == ring_hi) { col = ring_lo; }
+            }
+        }
+
+        // one store per output, where the scatter form issued one atomic per
+        // contributing query. This is the whole point of the kernel.
+#pragma unroll
+        for (int i = 0; i < NLOC_M1; i++) { dkx[i * BDIM_X] = acc_dk[i]; }
+        if (NLOC_M1 * BDIM_X + tidx < nchan_in) { dkx[NLOC_M1 * BDIM_X] = acc_dk[NLOC_M1]; }
+#pragma unroll
+        for (int i = 0; i < NLOC_M1; i++) { dvx[i * BDIM_X] = acc_dv[i]; }
+        if (NLOC_M1 * BDIM_X + tidx < nchan_out) { dvx[NLOC_M1 * BDIM_X] = acc_dv[NLOC_M1]; }
+    }
+
     // count by walking the supported range. Mirrors launch_spc_attn_fwd_ragged, and so
     // launch_spc_attn_bwd, minus its CHOUT_AS_IN branch (see the kernel).
     template <int BDIM_X, int BDIM_Y, int CUR_LOC, int MAX_LOC, bool TWO_PASS, typename STORAGE_T>
